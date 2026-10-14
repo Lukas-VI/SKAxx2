@@ -20,7 +20,7 @@ main.py              装配入口（全项目唯一 import 业务模块处）
 start.bat|ps1|sh     各平台一键启动脚本（自动建 .venv 并装依赖）
 config/
   config.yaml        声明式装配表：启用哪些渠道/工具/插件
-  persona.yaml       人设分档（local_full / cloud_safe）
+  persona.yaml       人设分档（本地私有，已 gitignore，克隆后自行创建）
   providers.yaml     本地 LLM 提供商实例与密钥（已 gitignore，首启自动生成）
   scheduler.yaml     定时任务（默认停用）
 ska/
@@ -76,6 +76,9 @@ python main.py
 1. 内置默认（代码常量）
 2. `config/config.yaml`
 3. 后台覆盖层（`data/admin.db` 的 `settings` 表，WebUI 改动写这里，不动 YAML）
+
+> `config/persona.yaml`（人设文本）与 `config/providers.yaml`（LLM 密钥）属本地私有配置，已加入 `.gitignore`；
+> 克隆仓库后需自行创建，缺失时人设为空、程序照常启动。
 
 ## 管理后台功能
 

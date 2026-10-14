@@ -21,11 +21,17 @@ def package_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def load_yaml(path: str | Path) -> dict[str, Any]:
-    """读取一个 YAML 文件为 dict。路径相对于项目根目录。"""
+def load_yaml(path: str | Path, *, required: bool = True) -> dict[str, Any]:
+    """读取一个 YAML 文件为 dict。路径相对于项目根目录。
+
+    required=False 时文件缺失返回空 dict：用于「本地私有、不入库」的配置，
+    （如 config/persona.yaml），保证克隆仓库后没有该文件也能正常启动。
+    """
     full = Path(path)
     if not full.is_absolute():
         full = package_root() / full
+    if not required and not full.exists():
+        return {}
     with full.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data if isinstance(data, dict) else {}
@@ -42,7 +48,7 @@ class Config:
 
     def __init__(self) -> None:
         self.cfg = load_yaml("config/config.yaml")
-        self.persona = load_yaml("config/persona.yaml")
+        self.persona = load_yaml("config/persona.yaml", required=False)   # 本地私有，可缺失
         self.scheduler = load_yaml("config/scheduler.yaml")
 
     # ------------------------------------------------------------------ 便捷访问
