@@ -1,0 +1,12 @@
+{
+  "_comment": "违禁词与敏感模式配置。迁移自老项目 core/message_filter.py 的默认值，格式保持不变：words 为字面词表，patterns 为正则（re.IGNORECASE）。filter 插件的 filter.py 会读取本文件。",
+  "words": [
+    "违禁词1",
+    "违禁词2",
+    "非法内容"
+  ],
+  "patterns": [
+    "[\\d]{11}",
+    "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+  ]
+}
