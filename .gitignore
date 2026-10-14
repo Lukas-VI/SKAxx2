@@ -31,3 +31,4 @@ config/providers.yaml
 # ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+config/persona.yaml
