@@ -111,7 +111,12 @@ class LLMGateway:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=httpx.Timeout(self.timeout + 5.0),
+                # 连接阶段给一个较短、独立的超时：地址不可达/端口不通时快速失败，
+                # 报错措辞与「读取慢」区分开。读取（生成）阶段给 timeout+5，
+                # 让外层 asyncio.timeout 先于 httpx 触发，从而统一走「整体超时」分支。
+                # 思考模型生成慢时，主要卡在读取阶段。
+                timeout=httpx.Timeout(self.timeout + 5.0,
+                                      connect=min(10.0, self.timeout)),
             )
         return self._client
 
@@ -172,7 +177,9 @@ class LLMGateway:
             resp.raise_for_status()
             data = resp.json()
         except asyncio.TimeoutError as e:
-            raise LLMError(f"LLM 调用超时（>{self.timeout}s）：{url}") from e
+            # 整体超时（连接+发送+等响应）：思考模型生成慢时最常命中这里
+            raise LLMError(
+                f"LLM 调用超时（整体 >{self.timeout}s，多为模型生成过慢）：{url}") from e
         except httpx.HTTPStatusError as e:
             body = e.response.text or ""
             # 中转把「结构化输出被截断」当硬错误（如 502 structured_output_failed）时，
@@ -181,6 +188,15 @@ class LLMGateway:
                 raise LLMTruncatedError(
                     f"LLM 输出被截断（HTTP {e.response.status_code}）：{body[:200]}") from e
             raise LLMError(f"LLM 返回错误状态 {e.response.status_code}：{body[:200]}") from e
+        except httpx.ConnectTimeout as e:
+            # 连不上服务端（TCP 握手超时）：地址/端口/网络问题，与「生成慢」区分
+            raise LLMError(f"LLM 连接超时（连不上服务端，检查地址与网络）：{url}") from e
+        except httpx.ConnectError as e:
+            # 连接被拒 / 域名不可达 / DNS 解析失败
+            raise LLMError(f"LLM 无法连接服务端（连接被拒或地址不可达）：{url}") from e
+        except httpx.ReadTimeout as e:
+            # 已连上，但服务端迟迟不返回（生成阶段卡住）
+            raise LLMError(f"LLM 读取超时（服务端已连接但迟迟不返回）：{url}") from e
         except httpx.HTTPError as e:
             raise LLMError(f"LLM 网络错误：{e}") from e
         except json.JSONDecodeError as e:

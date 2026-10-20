@@ -25,8 +25,10 @@ llm:
   api_key: "ollama"                        # Ollama 无需真实 key，占位即可
   model: "qwen2.5:7b"                      # 本地模型名；换 DeepSeek 时改这里
   temperature: 0.8
-  max_tokens: 1024
-  timeout: 60                              # 单次 LLM 调用超时（秒），用 asyncio.timeout 包裹
+  max_tokens: 102400
+  timeout: 300                             # 单次 LLM 调用超时（秒），用 asyncio.timeout 包裹。
+                                           # 思考模型（reasoner/本地大模型）生成很慢，60 常不够；
+                                           # 若报「调用超时」而非「无法连接」，就是这里太小。
   retry: 1                                 # 结构化解析失败后的重试次数（方案要求「重试一次」）
 
 # ---------------------------------------------------------------------------
@@ -107,7 +109,7 @@ tools:
 # 想更严：后台「智能体权限」页把对应工具的最小可用等级设为 admin。
 code:
   enabled: true                        # 总闸：已开启（终端命令可用）；改回 false 即全局禁用
-  allow_dirs: ["."]                    # 工作目录白名单：相对路径按**项目根**解析，"." 即项目根
+  allow_dirs: [".","D:/py/SKA/SKAxx2/ska/plugins", "E:/SKA-sandbox"]                    # 工作目录白名单：相对路径按**项目根**解析，"." 即项目根
                                        #   也可填绝对路径，如 ["D:/workdir"]；为空则一律拒绝执行
   timeout: 10                          # code_run 单条命令超时（秒）
   sandbox: true                        # 沙盒：清洗环境变量 + 危险命令黑名单（默认开，建议保持）
