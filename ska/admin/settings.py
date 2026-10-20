@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 APP_KEYS = ("bpm", "persona_profile", "tools", "plugins", "channels")
 
 # 覆盖层允许的小节白名单（防止前端塞入任意键）
-SECTIONS = ("app", "throttle", "memory", "agent", "qq", "web", "roles")
+SECTIONS = ("app", "throttle", "memory", "agent", "qq", "web", "roles", "webchat")
 
 # roles 小节默认值：聊天用户等级规则的全局设置（决策 D6）
 DEFAULT_ROLES: dict[str, Any] = {
@@ -64,11 +64,28 @@ DEFAULT_QQ: dict[str, Any] = {
 DEFAULT_WEB: dict[str, Any] = {"enabled": True, "host": "127.0.0.1", "port": 5098,
                                "session_hours": 72}
 
+# webchat 小节默认值（阶段三 §2.4 / 决策 E1、E2、E3）
+#   identity / user —— 在线聊天代表的聊天用户身份（默认 owner，决定权限等级与记忆归属）
+#   persist         —— 新建会话默认是否落库（false=沙盒，可单独在会话里改）
+#   poll_ms         —— 前端轮询间隔（决策 E2：默认 1 秒）
+#   compress_at     —— 上下文占用达到该比例即触发压缩（§3.3）
+#   context_window  —— 本渠道覆盖模型窗口（0 = 跟随当前提供商，默认跟随）
+DEFAULT_WEBCHAT: dict[str, Any] = {
+    "enabled": True,
+    "user": "owner",
+    "identity": "owner",
+    "persist": True,
+    "poll_ms": 1000,
+    "compress_at": 0.8,
+    "context_window": 0,
+}
+
 # 有「内置默认值」的小节：合并顺序 = 内置默认 → config.yaml → 后台覆盖层。
 # 这样即使 config.yaml 里没写这些小节，也能拿到可用默认值；
 # 写了就作为初值（后台可再覆盖），语义最直观。
 _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
-    "agent": DEFAULT_AGENT, "qq": DEFAULT_QQ, "web": DEFAULT_WEB, "roles": DEFAULT_ROLES,
+    "agent": DEFAULT_AGENT, "qq": DEFAULT_QQ, "web": DEFAULT_WEB,
+    "roles": DEFAULT_ROLES, "webchat": DEFAULT_WEBCHAT,
 }
 
 
@@ -150,10 +167,15 @@ class RuntimeSettings:
             "qq": self._mask_qq(self.qq()),
             "web": self.section("web"),
             "roles": self.section("roles"),
+            "webchat": self.webchat(),
         }
 
     def roles(self) -> dict[str, Any]:
         return self.section("roles")
+
+    def webchat(self) -> dict[str, Any]:
+        """在线聊天小节（阶段三）：身份 / 默认落库 / 轮询 / 压缩阈值。"""
+        return self.section("webchat")
 
     # ------------------------------------------------------------------ 内部
     def _apply_persona_override(self) -> None:

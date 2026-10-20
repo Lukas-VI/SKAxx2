@@ -148,13 +148,16 @@ class FetchTool(Tool):
 # ===========================================================================
 @tool("memory_ops")
 class MemoryOpsTool(Tool):
-    description = "读写长期记忆。action=search 检索旧事；action=remember 记下一件重要的事。"
+    description = ("读写记忆。action=search 检索旧事；action=remember 记下一件重要的事；"
+                   "action=pin 把一条内容提升为「核心记忆」（此后始终记得）；action=unpin 取消核心记忆。")
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["search", "remember"]},
-            "content": {"type": "string", "description": "search 的关键词，或 remember 要记的内容"},
-            "importance": {"type": "number", "description": "remember 时的重要性 0~1，默认 0.6"},
+            "action": {"type": "string", "enum": ["search", "remember", "pin", "unpin"]},
+            "content": {"type": "string",
+                        "description": "search/pin/unpin 的内容或关键词；remember 要记的内容"},
+            "importance": {"type": "number",
+                           "description": "remember/pin 时的重要性 0~1（pin 默认按 0.8 处理）"},
         },
         "required": ["action", "content"],
     }
@@ -170,4 +173,11 @@ class MemoryOpsTool(Tool):
         if action == "remember":
             await store.add_long(content, source="manual", importance=float(importance))
             return "记住了。"
+        if action == "pin":
+            # 提升为核心记忆：始终注入决策提示词，不依赖关键词检索
+            await store.pin_core(content, importance=max(float(importance), 0.8))
+            return "已记进核心记忆，往后会一直记得。"
+        if action == "unpin":
+            removed = await store.unpin_core(content)
+            return "已从核心记忆移除。" if removed else "核心记忆里没有这条内容。"
         return f"未知操作：{action}"

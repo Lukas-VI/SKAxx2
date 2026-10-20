@@ -9,10 +9,15 @@ import os
 import tempfile
 import time
 import unittest
+from pathlib import Path
+
+import yaml
 
 from ska.admin.policy import LEVELS, Policy, level_rank
+from ska.admin.service import AdminService
 from ska.admin.settings import RuntimeSettings
 from ska.admin.store import AdminStore
+from ska.kernel.config import write_persona_default
 from ska.kernel.packet import CoreInput
 from ska.web.auth import AuthService, hash_password, role_at_least, verify_password
 
@@ -298,6 +303,64 @@ class TestPolicy(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await p.can_publish("qq", "group", "111"))     # 不在白名单
         names = [t["target_id"] for t in await p.targets("qq")]
         self.assertEqual(names, ["999"])                                # 只列启用的
+
+
+# =========================================================================== 本地私有配置自动生成
+class _StubProviders:
+    """ProviderManager 的最小替身：只需要 path 与 save()。"""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.saved = False
+
+    def save(self) -> None:
+        self.saved = True
+        self.path.write_text("active: ''\nproviders: []\n", encoding="utf-8")
+
+
+class _StubMind:
+    def __init__(self) -> None:
+        self.refreshed = 0
+
+    def refresh_persona(self) -> None:
+        self.refreshed += 1
+
+
+class TestLocalConfigGeneration(unittest.TestCase):
+    """config/persona.yaml 与 config/providers.yaml 属本地私有配置（不入库），
+    由后台「首次初始化」（AdminService.ensure_local_config）自动补齐。"""
+
+    def test_write_persona_default_creates_then_keeps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "persona.yaml")
+            self.assertTrue(write_persona_default(path))          # 缺失 → 新建（含多级目录）
+            self.assertTrue(os.path.exists(path))
+
+            data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+            # 模板必须自带 build_system_prompt 消费的字段，且两档齐备
+            self.assertIn("local_full", data)
+            self.assertIn("cloud_safe", data)
+            self.assertTrue(data["local_full"]["identity"])
+            self.assertTrue(data["cloud_safe"]["speech_style"])
+
+            # 已存在时绝不覆盖用户自己写的人设
+            Path(path).write_text("local_full:\n  identity: 我自己的人设\n", encoding="utf-8")
+            self.assertFalse(write_persona_default(path))
+            self.assertIn("我自己的人设", Path(path).read_text(encoding="utf-8"))
+
+    def test_ensure_local_config_saves_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            providers = _StubProviders(os.path.join(tmp, "providers.yaml"))
+            mind = _StubMind()
+            svc = AdminService(app={"cfg": _StubCfg({}), "mind": mind},
+                               store=None, memory=None, settings=None,
+                               providers=providers, policy=None)
+
+            created = svc.ensure_local_config()
+            self.assertIsInstance(created, list)
+            self.assertTrue(providers.saved)                       # 提供商清单已落盘
+            self.assertTrue(providers.path.exists())
+            self.assertIn("config/providers.yaml", created)        # 原本不存在 → 记为新建
 
 
 if __name__ == "__main__":

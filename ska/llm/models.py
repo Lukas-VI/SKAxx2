@@ -41,6 +41,8 @@ class LLMResponse(BaseModel):
         model:     实际使用的模型名（回显）。
         usage:     token 用量（若服务端返回）。
         raw:       原始 message 对象，便于排查。
+        finish_reason: 结束原因（stop/length/tool_calls…）。为 "length" 表示输出被
+                       max_tokens 截断——上层据此「自动加预算重试」（见 structured_chat）。
     """
 
     content: str = ""
@@ -48,6 +50,7 @@ class LLMResponse(BaseModel):
     model: str = ""
     usage: dict[str, Any] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict)
+    finish_reason: str = ""                   # 可选：结束原因（截断检测用）
 
     def has_tool_call(self) -> bool:
         return self.tool_call is not None

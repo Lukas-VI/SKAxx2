@@ -4,11 +4,13 @@
 已实测能对中文做子串检索（「巧克力」可命中「我喜欢酒心巧克力」），
 足够用且零新增依赖（方案明确「不引向量库」）。第三期如需可再叠加 embedding。
 
-四张表 + 一张 FTS 虚表：
+六张表 + 一张 FTS 虚表（阶段三记忆升级：结构化事实 + 核心记忆）：
     messages     原始对话流水
     sessions     短期记忆：会话摘要
     long_memory  长期记忆（source = chat_summary / profile_fact / self_reflection / manual）
     profile      用户画像（facts 存 JSON）
+    entity_facts 结构化事实（Mem0 风格：subject/predicate/object，同槽位覆盖合并）
+    core_facts   核心记忆（MemGPT core 风格：始终注入提示词的少量高价值事实）
     memory_fts   fts5(content, keywords, tokenize='trigram')
 
 并发模型：单个 sqlite3 连接（check_same_thread=False）+ threading.Lock，
@@ -70,6 +72,35 @@ CREATE TABLE IF NOT EXISTS profile (
     facts      TEXT DEFAULT '[]',
     updated_ts REAL NOT NULL
 );
+
+-- 结构化事实（Mem0 风格）：把对话抽成 (subject, predicate, object) 三元组式事实，
+-- 同一 (subject, predicate) 视为「同一槽位」→ 新值覆盖旧值并累加 updated_count，
+-- 从而做到去重 + 冲突消解，而不是把自由文本一条条堆起来。
+CREATE TABLE IF NOT EXISTS entity_facts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user          TEXT DEFAULT '',
+    subject       TEXT NOT NULL,
+    predicate     TEXT NOT NULL,
+    object        TEXT NOT NULL,
+    fact          TEXT NOT NULL DEFAULT '',
+    importance    REAL NOT NULL DEFAULT 0.5,
+    first_seen    REAL NOT NULL,
+    last_seen     REAL NOT NULL,
+    updated_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_fact_user ON entity_facts(user);
+CREATE INDEX IF NOT EXISTS idx_fact_seen ON entity_facts(last_seen);
+
+-- 核心记忆（MemGPT/Letta core memory 风格）：少量「始终注入决策提示词」的高价值事实，
+-- 由 Agent 通过 memory_ops 主动 pin 进来；与需要检索的长期记忆分层区分。
+CREATE TABLE IF NOT EXISTS core_facts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user       TEXT DEFAULT '',
+    content    TEXT NOT NULL,
+    importance REAL NOT NULL DEFAULT 0.8,
+    created_ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_core_user ON core_facts(user);
 
 -- FTS5 虚表：trigram 分词支持中文子串；standalone，rowid 与 long_memory.id 对齐
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
@@ -198,21 +229,27 @@ class MemoryStore:
     async def search_long(self, query: str, *, top_k: int = 5,
                           half_life_days: float = 30.0,
                           user: str = "") -> list[str]:
-        """检索长期记忆：FTS5 trigram 匹配 → 按 importance·exp(-Δt/半衰期) 排序。"""
+        """检索长期记忆：三因子排序 relevance×importance×recency（见 _search_long_sync）。"""
         return await self._call(self._search_long_sync, query, top_k,
                                 half_life_days, user)
 
     def _search_long_sync(self, query: str, top_k: int, half_life_days: float,
                           user: str) -> list[str]:
+        """三因子排序（Generative Agents 风格，Stanford 2023）：
+
+            score = relevance × importance × recency_decay
+
+        之前只用 importance×衰减，相关性只是「命中/不命中」的二值；接入 FTS5 的
+        bm25（rank）后，越贴题的旧事越靠前，召回质量明显提升。
+        """
         candidates = self._fts_candidates(query)
         if not candidates:
             return []
-        # 候选 → 取 long_memory 行 → 时间衰减加权排序
         now = time.time()
         half_life = max(half_life_days, 1.0) * 86400.0
         scored: list[tuple[float, str]] = []
         with self._lock:
-            for rowid in candidates[:20]:
+            for rowid, relevance in candidates[:20]:
                 row = self._conn.execute(
                     "SELECT content, importance, created_ts, user FROM long_memory WHERE id=?",
                     (rowid,)).fetchone()
@@ -222,21 +259,28 @@ class MemoryStore:
                     continue
                 age = max(now - row["created_ts"], 0.0)
                 decay = math.exp(-age / half_life)
-                scored.append((row["importance"] * decay, row["content"]))
+                # 三因子相乘：相关度 × 重要度 × 时间衰减
+                scored.append((relevance * row["importance"] * decay, row["content"]))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:top_k]]
 
-    def _fts_candidates(self, query: str) -> list[int]:
-        """用 FTS5 找候选 rowid；无法分词（如单字）时退回 LIKE 扫描。"""
+    def _fts_candidates(self, query: str) -> list[tuple[int, float]]:
+        """用 FTS5 找候选 (rowid, 相关度)；无法分词（如单字）时退回 LIKE 扫描。
+
+        相关度来源：FTS5 的 rank 列（bm25，越负越相关）取负后，按候选内最大值
+        归一化到 (0,1]，好与 importance、衰减同尺度相乘。LIKE 兜底没有 bm25，
+        视为强匹配，相关度给 1.0。
+        """
         match_expr = _make_match_expr(query)
         with self._lock:
             if match_expr:
                 try:
                     rows = self._conn.execute(
-                        "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?"
+                        "SELECT rowid, rank FROM memory_fts WHERE memory_fts MATCH ?"
                         " ORDER BY rank LIMIT 50",
                         (match_expr,)).fetchall()
-                    return [r["rowid"] for r in rows]
+                    return _normalize_relevance(
+                        [(int(r["rowid"]), -float(r["rank"])) for r in rows])
                 except sqlite3.OperationalError as e:
                     logger.warning("FTS 查询失败，退回 LIKE：%s", e)
             # LIKE 兜底：处理 <3 字（trigram 无法匹配）等情况
@@ -246,7 +290,7 @@ class MemoryStore:
             rows = self._conn.execute(
                 "SELECT id FROM long_memory WHERE content LIKE ? ORDER BY created_ts DESC"
                 " LIMIT 50", (like,)).fetchall()
-        return [r["id"] for r in rows]
+        return [(int(r["id"]), 1.0) for r in rows]
 
     # ------------------------------------------------------------------ 管理端 CRUD
     # 以下方法供 WebUI「记忆管理」页使用（增删改查 + 分页），与上面的写入路径互不影响。
@@ -419,12 +463,143 @@ class MemoryStore:
                  time.time()))
             self._conn.commit()
 
+    # ------------------------------------------------------------------ 结构化事实
+    # Mem0 风格：「写前查重 + 冲突消解」——同一 (subject, predicate) 槽位视为同一件事，
+    # 新值覆盖旧值，避免自由文本一条条堆叠造成矛盾/重复。
+    async def upsert_fact(self, subject: str, predicate: str, obj: str, *,
+                          user: str = "", importance: float = 0.5,
+                          fact: str = "") -> str:
+        """写入一条结构化事实；同槽位则覆盖合并，返回 "added" 或 "updated"。"""
+        return await self._call(self._upsert_fact_sync, subject, predicate, obj,
+                                user or "", float(importance), fact)
+
+    def _upsert_fact_sync(self, subject: str, predicate: str, obj: str, user: str,
+                          importance: float, fact: str) -> str:
+        subject, predicate, obj = subject.strip(), predicate.strip(), obj.strip()
+        now = time.time()
+        text = fact.strip() or f"{subject}{predicate}{obj}"
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, importance FROM entity_facts"
+                " WHERE user=? AND lower(subject)=lower(?) AND lower(predicate)=lower(?)",
+                (user, subject, predicate)).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO entity_facts(user, subject, predicate, object, fact,"
+                    " importance, first_seen, last_seen, updated_count)"
+                    " VALUES(?,?,?,?,?,?,?,?,1)",
+                    (user, subject, predicate, obj, text, importance, now, now))
+                self._conn.commit()
+                return "added"
+            # 同槽位：新值覆盖旧值，重要性取较高者，刷新 last_seen 并累加更新次数
+            self._conn.execute(
+                "UPDATE entity_facts SET object=?, fact=?, importance=?, last_seen=?,"
+                " updated_count=updated_count+1 WHERE id=?",
+                (obj, text, max(importance, row["importance"]), now, row["id"]))
+            self._conn.commit()
+        return "updated"
+
+    async def list_facts(self, user: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        """列出结构化事实（后台展示 / 测试用）。"""
+        return await self._call(self._list_facts_sync, user, limit)
+
+    def _list_facts_sync(self, user: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            if user:
+                rows = self._conn.execute(
+                    "SELECT * FROM entity_facts WHERE user IN ('', ?)"
+                    " ORDER BY importance DESC, last_seen DESC LIMIT ?",
+                    (user, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM entity_facts ORDER BY importance DESC, last_seen DESC"
+                    " LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    async def search_facts(self, query: str, *, top_k: int = 4,
+                           half_life_days: float = 60.0, user: str = "") -> list[str]:
+        """检索结构化事实：2-gram 相关度 × importance × 衰减（中文友好、无需分词）。"""
+        return await self._call(self._search_facts_sync, query, top_k,
+                                half_life_days, user)
+
+    def _search_facts_sync(self, query: str, top_k: int, half_life_days: float,
+                           user: str) -> list[str]:
+        now = time.time()
+        half_life = max(half_life_days, 1.0) * 86400.0
+        with self._lock:
+            if user:
+                rows = self._conn.execute(
+                    "SELECT fact, importance, last_seen FROM entity_facts"
+                    " WHERE user IN ('', ?)", (user,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT fact, importance, last_seen FROM entity_facts").fetchall()
+        scored: list[tuple[float, str]] = []
+        for r in rows:
+            relevance = _relevance(query, r["fact"])
+            if relevance <= 0:
+                continue
+            decay = math.exp(-max(now - r["last_seen"], 0.0) / half_life)
+            scored.append((relevance * r["importance"] * decay, r["fact"]))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [c for _, c in scored[:top_k]]
+
+    # ------------------------------------------------------------------ 核心记忆
+    # MemGPT/Letta core memory 风格：少量「始终注入提示词」的高价值事实，由 Agent 主动提升。
+    async def pin_core(self, content: str, *, user: str = "", importance: float = 0.8) -> int:
+        """把一条内容提升为核心记忆（内容重复则幂等，返回其 id）。"""
+        return await self._call(self._pin_core_sync, content, user or "", float(importance))
+
+    def _pin_core_sync(self, content: str, user: str, importance: float) -> int:
+        content = content.strip()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM core_facts WHERE user=? AND content=?",
+                (user, content)).fetchone()
+            if row is not None:
+                return int(row["id"])              # 已存在 → 幂等，不重复写
+            cur = self._conn.execute(
+                "INSERT INTO core_facts(user, content, importance, created_ts)"
+                " VALUES(?,?,?,?)", (user, content, importance, time.time()))
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    async def unpin_core(self, content: str, *, user: str = "") -> bool:
+        """取消一条核心记忆。"""
+        return await self._call(self._unpin_core_sync, content.strip(), user or "")
+
+    def _unpin_core_sync(self, content: str, user: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM core_facts WHERE user=? AND content=?", (user, content))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    async def list_core(self, *, user: str = "", limit: int = 8) -> list[str]:
+        """取核心记忆内容（按重要性、时间排序），供决策提示词常驻注入。"""
+        return await self._call(self._list_core_sync, user, limit)
+
+    def _list_core_sync(self, user: str, limit: int) -> list[str]:
+        with self._lock:
+            if user:
+                rows = self._conn.execute(
+                    "SELECT content FROM core_facts WHERE user IN ('', ?)"
+                    " ORDER BY importance DESC, created_ts ASC LIMIT ?",
+                    (user, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT content FROM core_facts"
+                    " ORDER BY importance DESC, created_ts ASC LIMIT ?",
+                    (limit,)).fetchall()
+        return [r["content"] for r in rows]
+
     # ------------------------------------------------------------------ 辅助
     def stats(self) -> dict[str, int]:
         """各表行数（人工核对用）。"""
         with self._lock:
             out = {}
-            for table in ("messages", "sessions", "long_memory", "profile"):
+            for table in ("messages", "sessions", "long_memory", "profile",
+                          "entity_facts", "core_facts"):
                 out[table] = self._conn.execute(
                     f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
         return out
@@ -459,3 +634,35 @@ def _make_match_expr(query: str, max_grams: int = 8) -> str:
         return ""
     # 每个 gram 用双引号包裹成短语，避免被当成 FTS 语法
     return " OR ".join(f'"{g}"' for g in grams)
+
+
+def _normalize_relevance(pairs: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """把「越大越相关」的原始分归一到 (0,1]，好与 importance、衰减同尺度相乘。
+
+    同一次查询内所有候选走同一条路径（要么都来自 FTS 的 bm25，要么都来自 LIKE），
+    所以按候选内最大值归一化是自洽的。
+    """
+    top = max((v for _, v in pairs), default=0.0)
+    if top <= 0:
+        return [(rid, 1.0) for rid, _ in pairs]
+    return [(rid, v / top) for rid, v in pairs]
+
+
+def _char_grams(text: str, n: int = 2) -> set[str]:
+    """把文本切成 n-gram 字符集合（按词块滑窗），用于无分词器的中文相关度估算。"""
+    grams: set[str] = set()
+    for chunk in _GRAM_RE.findall((text or "").lower()):
+        if len(chunk) <= n:
+            grams.add(chunk)
+            continue
+        for i in range(len(chunk) - n + 1):
+            grams.add(chunk[i:i + n])
+    return grams
+
+
+def _relevance(query: str, text: str) -> float:
+    """相关度 = 命中的查询 n-gram 比例（0~1），中文友好且零依赖。"""
+    q = _char_grams(query)
+    if not q:
+        return 0.0
+    return len(q & _char_grams(text)) / len(q)

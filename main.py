@@ -23,8 +23,10 @@ from ska.heartbeat.beat import BeatLoop
 from ska.kernel.bus import EventBus
 from ska.kernel.config import Config
 from ska.kernel.context import SessionContext
+from ska.kernel.event import TOPIC_TRACE
 from ska.loop.agent import AgentLoop
 from ska.loop.mind import Mind
+from ska.loop.sessions import SessionRegistry
 from ska.memory.store import MemoryStore
 from ska.memory.summarizer import Summarizer
 
@@ -90,13 +92,41 @@ def build() -> dict[str, Any]:
     load_package("ska.tools")
     load_package("ska.io")
 
+    # 阶段三：在线聊天中枢（ChatHub）+ 会话登记表 + MindLine 轨迹（§2/§3/§4）
+    # 注意顺序：ChatHub 必须在渠道之前建好，才能经 ChannelDeps.extras 注入 webchat 渠道。
+    from ska.context import ContextBuilder
+    from ska.admin.trace import TraceLog
+    from ska.web.chat import ChatHub
+
+    # 上下文组装器（阶段三 §3.2）：窗口/系数做成回调，切换提供商后即时生效
+    webchat_cfg = settings.webchat() if settings is not None else cfg.section("webchat")
+    builder = ContextBuilder(window_fn=providers.context_window,
+                             ratio_fn=providers.token_ratio,
+                             compress_at=float(webchat_cfg.get("compress_at", 0.8) or 0.8))
+    hub = ChatHub(bus,
+                  default_identity=str(webchat_cfg.get("identity")
+                                       or webchat_cfg.get("user") or "owner"),
+                  default_persist=bool(webchat_cfg.get("persist", True)))
+    registry = SessionRegistry(window=int(cfg.memory.get("working_window", 20)))
+    # 轨迹落库（决策 E4：trace 是 log 的一部分）+ 内存环；订阅总线上的 TOPIC_TRACE
+    trace = TraceLog(admin_store, buffer=500)          # admin_store 为 None 时只进日志
+    trace.attach(bus)
+    # ChatHub 也订阅轨迹：把上下文占用 token 回填到会话状态条
+    bus.subscribe(TOPIC_TRACE, lambda ev: hub.on_trace(ev.payload))
+
     from ska.tools.base import ToolDeps, build_tools
     deps = ToolDeps(cfg=cfg, gateway=gateway, store=store, bus=bus)
     tools = build_tools(cfg.get("tools", []), deps)
 
+    # MCP 外部工具（阶段三 §5 增强）：默认关闭。这里只读配置建管理器，
+    # 真正的「拉起服务器 + 发现工具」放在运行阶段（需要事件循环），见 run()。
+    from ska.mcp.bridge import MCPManager
+    mcp = MCPManager.from_config(cfg)
+
     from ska.io.base import ChannelDeps, build_channels
     channels = build_channels(cfg.get("channels", ["cli"]),
-                              ChannelDeps(bus=bus, cfg=cfg, settings=settings))
+                              ChannelDeps(bus=bus, cfg=cfg, settings=settings,
+                                          extras={"chat_hub": hub}))
 
     # 人设 → system prompt（分档：local_full / cloud_safe）
     persona = cfg.build_system_prompt()
@@ -106,14 +136,16 @@ def build() -> dict[str, Any]:
     policy = (Policy(admin_store, settings, tools)
               if admin_store is not None and settings is not None else None)
 
-    # AgentLoop（执行者）+ Mind（决策者）
-    agent = AgentLoop(gateway, tools, persona)
+    # AgentLoop（执行者）+ Mind（决策者）；阶段三给二者注入总线以支持 MindLine 插桩
+    agent = AgentLoop(gateway, tools, persona, bus=bus)
     mind = Mind(gateway, agent, store=store, summarizer=summarizer,
-                cfg=cfg, persona_prompt=persona, policy=policy)
+                cfg=cfg, persona_prompt=persona, policy=policy,
+                bus=bus, builder=builder)
 
-    # 心跳
+    # 心跳：单例 ctx 作为兜底，多会话走 registry 路由（阶段三 §2.2）
     ctx = SessionContext(window=int(cfg.memory.get("working_window", 20)))
-    beat = BeatLoop(bus, cfg, mind, ctx, channels, settings=settings, policy=policy)
+    beat = BeatLoop(bus, cfg, mind, ctx, channels, settings=settings, policy=policy,
+                    registry=registry)
 
     app: dict[str, Any] = {
         "cfg": cfg, "bus": bus, "store": store, "summarizer": summarizer,
@@ -121,7 +153,10 @@ def build() -> dict[str, Any]:
         "agent": agent, "mind": mind, "ctx": ctx, "beat": beat,
         "plugins": [], "plugin_map": {},
         "admin_store": admin_store, "settings": settings, "policy": policy,
+        "mcp": mcp, "tool_deps": deps,
         "service": None, "auth": None, "api": None, "web": None,
+        # ---- 阶段三新增 ----
+        "chat_hub": hub, "registry": registry, "trace": trace, "builder": builder,
     }
 
     # 后台业务聚合 + HTTP 服务（阶段二 §5.3）
@@ -168,6 +203,50 @@ def install_plugins(app: dict[str, Any]) -> None:
         instance = module.install(bus, cfg)
         plugin_map[name] = instance
         app["plugins"].append(instance)
+        _collect_plugin_tools(app, instance)      # 插件可选地顺带贡献工具（阶段三增强）
+
+
+def _collect_plugin_tools(app: dict[str, Any], instance: Any) -> None:
+    """把插件贡献的工具合入工具表（可选钩子：contribute_tools(deps) -> {name: Tool}）。
+
+    与 MCPManager.inject 同理：合入的是同一张 tools dict，因此 AgentLoop 立即可见、
+    Policy 自动纳管；名字冲突时以既有工具为准（不覆盖内置/已装工具）。
+    """
+    contributor = getattr(instance, "contribute_tools", None)
+    if not callable(contributor):
+        return
+    try:
+        produced = contributor(app.get("tool_deps"))
+    except Exception:  # noqa: BLE001 —— 插件出错不能拖垮装配
+        logger.exception("插件贡献工具失败：%s", type(instance).__name__)
+        return
+    if not isinstance(produced, dict):
+        return
+    target = app["tools"]
+    added = 0
+    for name, tool in produced.items():
+        if name in target:
+            logger.warning("插件工具名冲突，忽略：%s", name)
+            continue
+        target[name] = tool
+        added += 1
+    if added:
+        logger.info("插件 %s 贡献了 %d 个工具", type(instance).__name__, added)
+
+
+async def _start_mcp(app: dict[str, Any], mcp: Any) -> None:
+    """后台连接 MCP 服务器，并把发现的工具合入装配好的工具表。
+
+    单个服务器失败由 MCPManager 内部吞掉（只记日志），这里再兜一层异常，
+    确保任何 MCP 问题都不会影响对话主链。
+    """
+    try:
+        await mcp.connect_all()
+        added = mcp.inject(app["tools"])
+        if added:
+            logger.info("MCP 工具已合入 AgentLoop：%d 个", added)
+    except Exception:  # noqa: BLE001
+        logger.exception("MCP 初始化异常（不影响主链）")
 
 
 # --------------------------------------------------------------------------- 运行
@@ -175,6 +254,13 @@ async def run(app: dict[str, Any]) -> None:
     """启动渠道并进入心跳主循环。"""
     # 装插件（需在事件循环内，scheduler 依赖 create_task）
     install_plugins(app)
+
+    # MCP 外部工具：后台拉起服务器并把发现的工具合入工具表（同一 dict，AgentLoop 立即可见）。
+    # 放后台是刻意的——服务器启动可能较慢/超时，不该拖住渠道与主循环的启动。
+    mcp = app.get("mcp")
+    if mcp is not None:
+        mcp_task = asyncio.create_task(_start_mcp(app, mcp))
+        app["mcp_task"] = mcp_task
 
     channels = app["channels"]
     # 先起渠道（接收任务），再进主循环
@@ -221,6 +307,16 @@ async def shutdown(app: dict[str, Any]) -> None:
             await ch.stop()
         except Exception:  # noqa: BLE001
             logger.exception("渠道停止异常：%s", getattr(ch, "name", ch))
+    # 1.5) MCP：先取消可能仍在连接的后台任务，再关闭已建立的服务器连接
+    mcp_task = app.get("mcp_task")
+    if mcp_task is not None and not mcp_task.done():
+        mcp_task.cancel()
+    mcp = app.get("mcp")
+    if mcp is not None:
+        try:
+            await mcp.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("MCP 关闭异常")
     # 2) 插件（优先按 plugin_map 遍历，覆盖运行期热装载的插件）
     plugin_map = app.get("plugin_map") or {}
     for plugin in list(plugin_map.values()) or app.get("plugins", []):

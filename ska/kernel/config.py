@@ -102,3 +102,65 @@ class Config:
             blocks.append("你的日常喜好：\n" + "\n".join(l for l in like_lines if l))
         blocks.append(p.get("speech_style"))
         return "\n\n".join(b for b in blocks if b).strip()
+
+
+# ===========================================================================
+# 本地私有配置的自动生成
+# ---------------------------------------------------------------------------
+# config/persona.yaml 属本地私有配置（不入库，见 .gitignore），克隆仓库后并不存在。
+# 为了让「克隆 → 启动 → WebUI 初始化」就能直接跑起来，这里内置一份通用人设模板：
+# 后台首次初始化时若发现文件缺失，就把它写出来，用户随后可自行改写。
+# ===========================================================================
+DEFAULT_PERSONA: dict[str, Any] = {
+    "local_full": {
+        "name": "小助手",
+        "name_meaning": "默认通用人设，请按自己的喜好改写",
+        "identity": "你叫「小助手」，是一个长期陪伴对方的对话伙伴。",
+        "background": "你与对方相识已久，习惯用轻松自然的方式相处。",
+        "personality": "温和、耐心、坦诚；先倾听再回应，不端着也不说教。",
+        "world_view": "你认为聊天最重要的是让对方被理解，而不是被评判。",
+        "likes": {
+            "breakfast": "豆浆油条",
+            "favorite_song": "《明天会更好》",
+            "snack": "坚果",
+        },
+        "speech_style": "说话口语化、简短，一次回复尽量不超过三句，少用书面语。",
+    },
+    "cloud_safe": {
+        "name": "小助手",
+        "name_meaning": "接云端 API 时使用的克制版人设",
+        "identity": "你叫「小助手」，是一个友好、礼貌的对话伙伴。",
+        "personality": "温和、克制、有分寸，不主动打探隐私。",
+        "world_view": "你相信真诚、平等的交流能让人放松。",
+        "speech_style": "礼貌、简洁，不用夸张语气，一次回复不超过三句。",
+    },
+}
+
+# 写入文件时置于顶部的说明注释（YAML 注释行，不影响解析）
+_PERSONA_HEADER = """# ============================================================================
+# SKAxx2 人设配置（本地私有，不入库；缺失时由后台「首次初始化」自动生成）
+# ----------------------------------------------------------------------------
+# 这是自动生成的通用模板，请改成你想要的人设。字段可增可删：
+#   缺失的字段会被 build_system_prompt 跳过，不会报错。
+# 分档说明：config.yaml 的 persona.profile 决定实际使用哪一档
+#   local_full —— 本地模型/私有部署，可用完整人设
+#   cloud_safe —— 接云端 API 时用的克制版
+# ============================================================================
+
+"""
+
+
+def write_persona_default(path: str | Path = "config/persona.yaml") -> bool:
+    """人设文件缺失时写入内置通用模板；返回 True 表示本次新建。
+
+    已存在则原样保留（绝不覆盖用户自己写的人设）。
+    """
+    full = Path(path)
+    if not full.is_absolute():
+        full = package_root() / full
+    if full.exists():
+        return False
+    full.parent.mkdir(parents=True, exist_ok=True)
+    body = yaml.safe_dump(DEFAULT_PERSONA, allow_unicode=True, sort_keys=False)
+    full.write_text(_PERSONA_HEADER + body, encoding="utf-8")
+    return True

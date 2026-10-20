@@ -26,28 +26,39 @@ from .gateway import LLMError, LLMGateway
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 内置预设模板：WebUI「一键添加」时预填 base_url / model 等字段
+# 内置预设模板：WebUI「一键添加」时预填 base_url / model / context_window 等字段
 # 注意 api_key 一律留空（需用户自己填），避免把占位串当真实密钥发出。
+# context_window 是「默认上下文窗口大小」的预填值（各模型常见值），可在表单里手改；
+# 它决定压缩触发点（ContextBuilder 用它算预算，占用达到 compress_at 即压缩，见 §3.3）。
 # ---------------------------------------------------------------------------
 PRESETS: list[dict[str, Any]] = [
     {"id": "ollama", "label": "Ollama 本地", "kind": "openai_compatible",
-     "base_url": "http://localhost:11434/v1", "api_key": "ollama", "model": "qwen2.5:7b"},
+     "base_url": "http://localhost:11434/v1", "api_key": "ollama", "model": "qwen2.5:7b",
+     "context_window": 32768},
     {"id": "deepseek", "label": "DeepSeek", "kind": "openai_compatible",
-     "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat"},
+     "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat",
+     "context_window": 65536},
     {"id": "openai", "label": "OpenAI", "kind": "openai_compatible",
-     "base_url": "https://api.openai.com/v1", "api_key": "", "model": "gpt-4o-mini"},
+     "base_url": "https://api.openai.com/v1", "api_key": "", "model": "gpt-4o-mini",
+     "context_window": 128000},
     {"id": "dashscope", "label": "通义千问（DashScope）", "kind": "openai_compatible",
      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "",
-     "model": "qwen-plus"},
+     "model": "qwen-plus", "context_window": 131072},
     {"id": "zhipu", "label": "智谱 GLM", "kind": "openai_compatible",
-     "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key": "", "model": "glm-4-flash"},
+     "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key": "", "model": "glm-4-flash",
+     "context_window": 131072},
     {"id": "moonshot", "label": "Moonshot（Kimi）", "kind": "openai_compatible",
-     "base_url": "https://api.moonshot.cn/v1", "api_key": "", "model": "moonshot-v1-8k"},
+     "base_url": "https://api.moonshot.cn/v1", "api_key": "", "model": "moonshot-v1-8k",
+     "context_window": 8192},
     {"id": "custom", "label": "自定义（OpenAI 兼容）", "kind": "openai_compatible",
-     "base_url": "", "api_key": "", "model": ""},
+     "base_url": "", "api_key": "", "model": "", "context_window": 8192},
 ]
 
 # 每个提供商实例的默认字段（缺失时补齐，避免下游到处写 .get 兜底）
+# 阶段三新增三个上下文工程字段（见方案 §3.1）：
+#   context_window —— 该模型的上下文窗口大小（token），ContextBuilder 据此算预算；
+#   token_ratio    —— 估算系数覆盖（0=自动按中英文加权判定，见 ska/context/estimator）；
+#   compress       —— 压缩策略名（保留字段，当前默认策略为空即按内置滚动摘要）。
 _DEFAULTS: dict[str, Any] = {
     "kind": "openai_compatible",
     "api_key": "",
@@ -55,6 +66,9 @@ _DEFAULTS: dict[str, Any] = {
     "max_tokens": 1024,
     "timeout": 60,
     "enabled": True,
+    "context_window": 8192,
+    "token_ratio": 0,
+    "compress": "",
 }
 
 # id 合法字符：字母数字、下划线、连字符、点（用于自动生成与校验）
@@ -144,6 +158,16 @@ class ProviderManager:
         out["max_tokens"] = int(out.get("max_tokens", 1024))
         out["timeout"] = int(out.get("timeout", 60))
         out["enabled"] = bool(out.get("enabled", True))
+        # 阶段三：上下文工程字段（容错归一，任何非法值都退回默认，绝不抛异常）
+        try:
+            out["context_window"] = max(int(out.get("context_window") or 8192), 256)
+        except (TypeError, ValueError):
+            out["context_window"] = 8192
+        try:
+            out["token_ratio"] = max(float(out.get("token_ratio") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            out["token_ratio"] = 0.0
+        out["compress"] = str(out.get("compress") or "")
         return out
 
     @staticmethod
@@ -268,7 +292,30 @@ class ProviderManager:
         """当前生效提供商的摘要（供 /api/status 展示）。"""
         item = self.active_cfg() or {}
         return {"id": self.active_id(), "model": item.get("model", ""),
-                "base_url": item.get("base_url", "")}
+                "base_url": item.get("base_url", ""),
+                "context_window": int(item.get("context_window", 8192)),
+                "token_ratio": float(item.get("token_ratio", 0.0))}
+
+    # ------------------------------------------------------------------ 上下文工程（阶段三 §3.1）
+    def context_window(self) -> int:
+        """当前生效提供商的上下文窗口（token）。
+
+        做成「即时读取」而不是构造时读死：ContextBuilder 把它作为 window_fn 回调，
+        于是「切换提供商」后无需重建 builder，下一次组装就用新窗口。
+        """
+        item = self.active_cfg() or {}
+        try:
+            return max(int(item.get("context_window", 8192)), 256)
+        except (TypeError, ValueError):
+            return 8192
+
+    def token_ratio(self) -> float:
+        """当前生效提供商的估算系数覆盖（0 表示按中英文自动加权）。"""
+        item = self.active_cfg() or {}
+        try:
+            return max(float(item.get("token_ratio", 0.0)), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     # ------------------------------------------------------------------ 连通性测试
     async def test(self, provider_id: str) -> dict[str, Any]:

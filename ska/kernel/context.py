@@ -50,6 +50,21 @@ class SessionContext:
         self.started_ts = time.time()
         self.last_ts = self.started_ts
 
+    def drop_oldest(self, n: int) -> int:
+        """丢弃最旧的 n 条消息，返回实际丢弃条数（阶段三压缩用）。
+
+        与 clear() 的区别：clear 是「会话边界」的整体清窗，本方法只截掉被摘要
+        吸收掉的那一段，保留最近的若干轮，避免压缩后对话体验断层。
+        """
+        count = min(max(int(n), 0), len(self._msgs))
+        for _ in range(count):
+            self._msgs.popleft()
+        return count
+
+    def snapshot(self) -> list[Message]:
+        """取当前窗口的浅拷贝（压缩/摘要时传出去，避免与后续写入竞争）。"""
+        return list(self._msgs)
+
     # ------------------------------------------------------------------ 读取
     def recent(self, n: int | None = None) -> list[Message]:
         """取最近 n 条（n 为 None 则取满窗口）。"""

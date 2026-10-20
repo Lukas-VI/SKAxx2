@@ -119,6 +119,46 @@ class TestProviderManager(unittest.TestCase):
         self.assertEqual(info["id"], "p1")
         self.assertEqual(info["model"], "m1")
 
+    # ------------------------------------------------------------------ 上下文窗口（阶段三 §3.1）
+    def test_context_window_added_and_used(self):
+        """新增时手填的 context_window 会被保存，并成为压缩窗口的来源。"""
+        mgr = self._manager()
+        mgr.add({"id": "p1", "base_url": "http://x/v1", "model": "m1",
+                 "context_window": 32768})
+        self.assertEqual(mgr.get("p1")["context_window"], 32768)
+        self.assertEqual(mgr.context_window(), 32768)          # active=首个实例
+        self.assertEqual(mgr.active_info()["context_window"], 32768)
+
+    def test_context_window_defaults_to_8192(self):
+        """未填/非法值统一退回默认 8192（绝不抛异常）。"""
+        mgr = self._manager()
+        mgr.add({"id": "p1", "base_url": "http://x", "model": "m1"})
+        self.assertEqual(mgr.context_window(), 8192)
+        mgr.update("p1", {"context_window": "abc"})            # 非法字符串 → 回落
+        self.assertEqual(mgr.get("p1")["context_window"], 8192)
+
+    def test_context_window_lower_bound(self):
+        """过小的窗口被夹到下限 256（避免预算算出 0）。"""
+        mgr = self._manager()
+        mgr.add({"id": "p1", "base_url": "http://x", "model": "m1", "context_window": 10})
+        self.assertEqual(mgr.context_window(), 256)
+
+    def test_context_window_switch_provider(self):
+        """切换 active 提供商后，压缩窗口即时跟随新提供商（回调式读取）。"""
+        mgr = self._manager()
+        mgr.add({"id": "p1", "base_url": "http://x", "model": "m1", "context_window": 8192})
+        mgr.add({"id": "p2", "base_url": "http://y", "model": "m2", "context_window": 65536})
+        self.assertEqual(mgr.context_window(), 8192)
+        mgr.activate("p2")
+        self.assertEqual(mgr.context_window(), 65536)
+
+    def test_presets_carry_context_window(self):
+        """预设模板应带上各模型的常见窗口值，供新增表单预填。"""
+        windows = {p["id"]: p.get("context_window") for p in PRESETS}
+        self.assertEqual(windows["deepseek"], 65536)
+        self.assertEqual(windows["openai"], 128000)
+        self.assertTrue(all(v and v >= 256 for v in windows.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

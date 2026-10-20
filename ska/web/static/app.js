@@ -186,6 +186,12 @@ function renderMain(session) {
 
   function show(id) {
     const page = pages.find((p) => p.id === id) || pages[0];
+    // 切换页面前先执行上一页注册的清理钩子（如停止轮询定时器），
+    // 避免「在线聊天 / MindLine」在后台继续 1 秒轮询、白白占用资源。
+    if (typeof window.__teardown === 'function') {
+      try { window.__teardown(); } catch (e) { /* 清理失败不影响切页 */ }
+    }
+    window.__teardown = null;
     nav.querySelectorAll('.nav-item').forEach((n) =>
       n.classList.toggle('active', n.dataset.id === page.id));
     const root = document.getElementById('page');
@@ -296,6 +302,7 @@ const PAGES = [
       const rows = d.providers.map((p) => [
         esc(p.label) + (p.is_active ? ' <span class="badge ok">使用中</span>' : ''),
         esc(p.id), esc(p.base_url), esc(p.model),
+        esc(p.context_window) + ' token',        // 默认上下文窗口（参与压缩触发）
         p.has_key ? '<span class="badge">已填密钥</span>' : '<span class="badge warn">无密钥</span>',
         `<div class="inline">
            <button class="mini ghost" data-act="test" data-id="${esc(p.id)}">测试</button>
@@ -306,7 +313,7 @@ const PAGES = [
       const opts = d.presets.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
       c.innerHTML = `
         <div class="panel"><h3>已有提供商</h3>
-          ${table(['名称', 'ID', '地址', '模型', '密钥', '操作'], rows)}
+          ${table(['名称', 'ID', '地址', '模型', '上下文窗口', '密钥', '操作'], rows)}
         </div>
         <div class="panel"><h3>新增提供商</h3>
           <div class="row">
@@ -319,6 +326,9 @@ const PAGES = [
             <div><label>接口地址 base_url</label><input id="p-base"></div>
             <div><label>API Key</label>
               <input id="p-key" type="password" placeholder="（已填则留空不修改）"></div>
+            <div><label>默认上下文窗口（token）</label>
+              <input id="p-window" type="number" min="256" step="256"
+                     placeholder="例如 32768（参与压缩触发）"></div>
           </div>
           <div class="spacer"></div><button id="p-add">添加</button>
           <pre class="out" id="p-out" style="display:none"></pre>
@@ -332,6 +342,8 @@ const PAGES = [
         c.querySelector('#p-base').value = p.base_url || '';
         c.querySelector('#p-key').value = p.api_key || '';
         c.querySelector('#p-id').value = p.id || '';
+        // 预设自带各模型的常见窗口值；用户可在此手改（决定压缩触发点）
+        c.querySelector('#p-window').value = p.context_window || 8192;
       };
       c.querySelector('#p-preset').onchange = fill;
       fill();
@@ -344,6 +356,7 @@ const PAGES = [
             base_url: c.querySelector('#p-base').value.trim(),
             model: c.querySelector('#p-model').value.trim(),
             api_key: c.querySelector('#p-key').value.trim(),
+            context_window: Number(c.querySelector('#p-window').value) || 8192,
           });
           setMsg(root, '已添加'); this.load(root, c);
         } catch (e) { setMsg(root, e.message, true); }
@@ -705,7 +718,7 @@ const PAGES = [
     id: 'settings', label: '设置', desc: '心跳节拍、主动发言三重闸、人设与记忆参数', ownerOnly: true,
     async load(root, c) {
       const s = await api('GET', '/api/settings');
-      const th = s.throttle, mem = s.memory, qq = s.qq, web = s.web;
+      const th = s.throttle, mem = s.memory, qq = s.qq, web = s.web, wc = s.webchat;
       c.innerHTML = `
         <div class="panel"><h3>基础</h3>
           <div class="grid2">
@@ -735,6 +748,21 @@ const PAGES = [
             <div><label>时间衰减半衰期（天）</label><input id="s-half" type="number" value="${mem.recall_half_life_days}"></div>
           </div>
         </div>
+        <div class="panel"><h3>在线聊天（阶段三）</h3>
+          <div class="grid2">
+            <div><label>聊天身份 identity（决定权限等级与记忆归属）</label>
+              <input id="s-wc-id" value="${esc(wc.identity || wc.user || 'owner')}"></div>
+            <div><label>上下文窗口覆盖（0 = 跟随当前提供商）</label>
+              <input id="s-wc-window" type="number" value="${wc.context_window}"></div>
+            <div><label>轮询间隔 poll_ms（毫秒）</label>
+              <input id="s-wc-poll" type="number" value="${wc.poll_ms}"></div>
+            <div><label>压缩阈值 compress_at（0~1，占比到达即压缩）</label>
+              <input id="s-wc-compress" type="number" step="0.05" value="${wc.compress_at}"></div>
+          </div>
+          <div class="checkbox"><input type="checkbox" id="s-wc-persist" ${wc.persist ? 'checked' : ''}>
+            <label for="s-wc-persist" style="margin:0">新建会话默认保存记忆（关 = 沙盒：照常推理但不落库）</label></div>
+          <p class="hint">身份默认 owner（实验平台主人）；沙盒会话适合边聊边调试、教智能体，不污染长期记忆。</p>
+        </div>
         <div class="panel"><h3>后台服务</h3>
           <div class="grid2">
             <div><label>监听地址</label><input id="s-host" value="${esc(web.host)}"></div>
@@ -759,6 +787,13 @@ const PAGES = [
             web: { host: c.querySelector('#s-host').value.trim(), port: num('#s-port'),
               session_hours: num('#s-hours') },
             qq: { api_base: qq.api_base },
+            webchat: {
+              identity: c.querySelector('#s-wc-id').value.trim() || 'owner',
+              persist: c.querySelector('#s-wc-persist').checked,
+              poll_ms: num('#s-wc-poll') || 1000,
+              compress_at: parseFloat(c.querySelector('#s-wc-compress').value) || 0.8,
+              context_window: num('#s-wc-window'),
+            },
           });
           setMsg(root, '已保存（部分项下次心跳/重启生效）');
         } catch (e) { setMsg(root, e.message, true); }
@@ -766,6 +801,12 @@ const PAGES = [
     },
   },
 ];
+
+// 并入外部页面脚本注册的页（chat.js / mindline.js 先于本文件加载，
+// 各自把页对象 push 进 window.EXTRA_PAGES，这里统一合入导航）。
+if (Array.isArray(window.EXTRA_PAGES)) {
+  PAGES.push(...window.EXTRA_PAGES);
+}
 
 // 通用的「删除按钮」绑定
 function bindDelete(container, root, selector, urlOf, after) {

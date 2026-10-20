@@ -16,9 +16,11 @@ import asyncio
 import importlib
 import logging
 import pkgutil
+from pathlib import Path
 from typing import Any
 
 from ..io.onebot import OneBotClient, OneBotError
+from ..kernel.config import load_yaml, write_persona_default
 from .policy import LEVELS
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,52 @@ class AdminService:
         self.settings = settings        # RuntimeSettings
         self.providers = providers      # ProviderManager
         self.policy = policy            # Policy
+
+    # ================================================================== 首次初始化
+    def ensure_local_config(self) -> list[str]:
+        """补齐「本地私有配置」文件，返回本次**新建**的文件名列表。
+
+        这两个文件不入库（见 .gitignore），克隆仓库后并不存在；后台「首次初始化」
+        调用它，做到「克隆 → 启动 → 初始化」即可直接使用：
+            * config/persona.yaml   —— 内置通用人设模板（用户随后可自行改写）
+            * config/providers.yaml —— 提供商清单与密钥（ProviderManager 负责落盘）
+
+        已存在的文件一律不动，避免覆盖用户自己的内容。
+        """
+        created: list[str] = []
+
+        # 1) 人设模板
+        try:
+            if write_persona_default():
+                created.append("config/persona.yaml")
+        except Exception:  # noqa: BLE001 —— 生成失败不应阻断初始化流程
+            logger.exception("生成 config/persona.yaml 失败")
+
+        # 2) 提供商清单。文件由 ProviderManager 在首次启动时就已落盘，
+        #    这里再存一次，保证初始化期间在向导里填的密钥被写入文件。
+        prov_path = getattr(self.providers, "path", None)
+        existed = bool(prov_path is not None and Path(prov_path).exists())
+        try:
+            self.providers.save()
+            if not existed:
+                created.append("config/providers.yaml")
+        except Exception:  # noqa: BLE001
+            logger.exception("生成 config/providers.yaml 失败")
+
+        # 3) 人设模板刚写出来时，让 Mind 立刻按新模板重建 system prompt，
+        #    否则要等到下次重启才生效（此时 cfg.persona 还停留在空档）。
+        if any(name.endswith("persona.yaml") for name in created):
+            cfg = self.app.get("cfg")
+            if cfg is not None:
+                cfg.persona = load_yaml("config/persona.yaml", required=False)
+            refresh = getattr(self.app.get("mind"), "refresh_persona", None)
+            if refresh:
+                try:
+                    refresh()
+                except Exception:  # noqa: BLE001
+                    logger.exception("按新人设重建 system prompt 失败")
+
+        return created
 
     # ================================================================== 运行状态
     async def status(self) -> dict[str, Any]:
@@ -65,7 +113,7 @@ class AdminService:
     async def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         """合并式保存设置：写库 → 更新内存快照 → 尽可能热生效。"""
         over = self.settings.overrides()
-        for section in ("throttle", "memory", "agent", "qq", "web", "roles"):
+        for section in ("throttle", "memory", "agent", "qq", "web", "roles", "webchat"):
             part = payload.get(section)
             if isinstance(part, dict):
                 over.setdefault(section, {}).update(part)
@@ -98,6 +146,21 @@ class AdminService:
         # QQ 参数变化 → 重连渠道
         if "qq" in payload:
             await self.reload_qq()
+        # webchat 参数变化 → 立刻把默认身份 / 落库开关同步给 ChatHub（新建会话即生效）
+        if "webchat" in payload:
+            self._sync_chat_defaults()
+
+    def _sync_chat_defaults(self) -> None:
+        """把 webchat 小节的默认身份与 persist 同步到 ChatHub 与渠道（热改生效）。"""
+        hub = self.app.get("chat_hub")
+        if hub is None:
+            return
+        cfg = self.settings.webchat()
+        hub.default_identity = str(cfg.get("identity") or cfg.get("user") or "owner")
+        hub.default_persist = bool(cfg.get("persist", True))
+        channel = self.app.get("channels", {}).get("webchat")
+        if channel is not None:
+            channel.hub = hub
 
     # ================================================================== 插件
     def _available_plugins(self) -> list[str]:
@@ -288,6 +351,92 @@ class AdminService:
         total = int(usage.get("total_tokens") or (prompt + completion))
         await self.store.record_usage(provider, model, task or "chat",
                                       prompt, completion, total)
+
+    # ================================================================== 在线聊天（阶段三 §2.4）
+    def _chat_hub(self):
+        """取 ChatHub（未装配时抛可读错误，由 API 层转成 4xx）。"""
+        hub = self.app.get("chat_hub")
+        if hub is None:
+            raise ValueError("在线聊天不可用（ChatHub 未装配）")
+        return hub
+
+    async def chat_meta(self) -> dict[str, Any]:
+        """聊天页状态条所需的元信息：身份 / 等级 / 默认落库 / 轮询间隔 / 模型窗口。"""
+        cfg = self.settings.webchat()
+        identity = str(cfg.get("identity") or cfg.get("user") or "owner")
+        level = "member"
+        if self.policy is not None:
+            try:
+                level = await self.policy.level_of("webchat", identity)
+            except Exception:  # noqa: BLE001 —— 等级查询失败不该阻断页面
+                logger.debug("读取聊天身份等级失败", exc_info=True)
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "identity": identity,
+            "level": level,
+            "persist": bool(cfg.get("persist", True)),
+            "poll_ms": int(cfg.get("poll_ms", 1000) or 1000),
+            "context_window": self.providers.context_window(),
+        }
+
+    async def chat_list(self) -> list[dict[str, Any]]:
+        return self._chat_hub().list()
+
+    async def chat_create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        hub = self._chat_hub()
+        session = hub.create(
+            title=str(payload.get("title") or ""),
+            persist=None if payload.get("persist") is None else bool(payload.get("persist")),
+            identity=str(payload.get("identity") or ""),
+            session_id=str(payload.get("id") or ""))
+        return session.info()
+
+    async def chat_update(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        hub = self._chat_hub()
+        return hub.update(
+            session_id,
+            title=payload.get("title"),
+            persist=None if payload.get("persist") is None else bool(payload.get("persist")),
+            identity=payload.get("identity"))
+
+    async def chat_delete(self, session_id: str) -> bool:
+        """关闭会话：内存会话 + 对应工作记忆窗口一并释放（已落库流水不受影响）。"""
+        hub = self._chat_hub()
+        session = hub.get(session_id)
+        identity = session.identity if session is not None else ""
+        ok = hub.delete(session_id)
+        registry = self.app.get("registry")
+        if registry is not None and identity:
+            registry.drop(f"webchat:{identity}:{session_id}")
+        return ok
+
+    async def chat_send(self, payload: dict[str, Any]) -> dict[str, Any]:
+        hub = self._chat_hub()
+        return await hub.submit(
+            str(payload.get("session_id") or ""),
+            str(payload.get("text") or ""),
+            str(payload.get("user_name") or ""))
+
+    async def chat_poll(self, session_id: str, after: int = 0) -> dict[str, Any]:
+        return self._chat_hub().poll(session_id, after)
+
+    async def chat_history(self, session_id: str) -> dict[str, Any]:
+        return self._chat_hub().history(session_id)
+
+    # ================================================================== 轨迹（MindLine §4.4）
+    async def trace_list(self, after: int = 0, session: str = "",
+                         limit: int = 300) -> list[dict[str, Any]]:
+        """增量读取轨迹：优先内存环形缓冲（快），未装配时退回库查询。"""
+        log = self.app.get("trace")
+        if log is not None:
+            return log.recent(after, session, limit)
+        return await self.store.list_traces(after, session, limit)
+
+    async def trace_clear(self) -> int:
+        log = self.app.get("trace")
+        if log is not None:
+            log.clear()
+        return await self.store.clear_traces()
 
     # ================================================================== QQ 适配器
     def _qq_channel(self):

@@ -13,7 +13,7 @@ import unittest
 from typing import Any
 
 from ska.kernel.context import SessionContext
-from ska.kernel.packet import CoreInput, ToolCall
+from ska.kernel.packet import CoreInput, Decision, Route, ToolCall
 from ska.llm.models import ChatMessage, LLMResponse
 from ska.loop.agent import AgentLoop
 from ska.loop.mind import Mind
@@ -112,6 +112,15 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         result = await loop.run([ChatMessage(role="user", content="查吧")])
         self.assertTrue(result.stopped)
         self.assertLessEqual(len(result.steps), 3)
+
+    async def test_repeated_tool_call_terminated_early(self):
+        """模型连续用同一参数调同一工具 → 提前止损（不必耗尽 max_steps）。"""
+        llm = FakeLLM([("继续查", ToolCall(name="time", args={}))])
+        loop = AgentLoop(llm, self._tools(), "你是助手", max_steps=5)
+        result = await loop.run([ChatMessage(role="user", content="查吧")])
+        self.assertTrue(result.stopped)
+        self.assertEqual(len(result.steps), 3)      # 第 3 次重复时终止
+        self.assertLess(len(result.steps), 5)
 
     async def test_tool_error_does_not_crash_loop(self):
         """工具抛异常 → 观察文本转成「工具执行失败」，循环继续。"""
@@ -234,6 +243,77 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
         user_text = decision_call[-1].content
         self.assertIn("酒心巧克力", user_text)
         self.assertIn("酒心巧克力", result.output.content)
+
+    async def test_decision_prompt_lists_available_tools(self):
+        """工具感知：决策提示词里应出现可用工具的名字与说明。
+
+        回归缺陷：决策阶段若不注入工具清单，模型永远只会选 speak/silence，
+        表现就是「智能体不知道自己能调工具」。
+        """
+        class CalcTool:
+            name = "calc_x"
+            description = "算一算数学表达式"
+
+            async def run(self, **kwargs: Any) -> str:
+                return "42"
+
+            def schema(self) -> dict[str, Any]:
+                return {"type": "function",
+                        "function": {"name": self.name, "description": self.description,
+                                     "parameters": {"type": "object", "properties": {}}}}
+
+        llm = FakeLLM([
+            ("他在问我算数。", None),                 # 内独白
+            ('{"action":"speak","content":"42","importance":0.3,"reason":"算数"}', None),
+        ])
+        loop = AgentLoop(llm, {"calc_x": CalcTool()}, "你是助手")
+        mind = Mind(llm, loop, store=self.store, persona_prompt="你叫小赛。")
+        await mind.wake(SessionContext(20), self._input("1+1等于几"))
+
+        decision_call = llm.calls[1]                  # calls[0]=独白，calls[1]=决策
+        user_text = decision_call[-1].content
+        self.assertIn("calc_x", user_text)            # 工具名进提示词
+        self.assertIn("算一算数学表达式", user_text)   # 工具说明也进提示词
+
+    async def test_route_overrides_output_channel(self):
+        """Agent 自主路由：decision.route 可把输出投到别的渠道/会话/群。"""
+        mind = self._mind(FakeLLM([("x", None)]))
+        trigger = self._input()                        # 触发来路：cli / 私聊 / 空会话
+        out = mind._to_output(
+            "好", trigger,
+            Decision(action="speak", content="好",
+                     route=Route(channel="qq", user="999",
+                                 message_type="group", group_id="456")))
+        self.assertEqual(out.channel, "qq")            # 渠道被 route 覆盖
+        self.assertEqual(out.user, "999")
+        self.assertEqual(out.target, "group_msg")      # qq + group → 群消息
+        self.assertEqual(out.group_id, "456")
+        self.assertEqual(out.session, "")              # 未指定 → 沿用触发来路
+
+    async def test_route_empty_fields_keep_trigger_route(self):
+        """route 只覆盖填了的字段，其余沿用触发来路（逐字段覆盖语义）。"""
+        mind = self._mind(FakeLLM([("x", None)]))
+        trigger = self._input().model_copy(update={"session": "s9"})
+        out = mind._to_output("好", trigger,
+                              Decision(action="speak", content="好",
+                                       route=Route(channel="qq")))
+        self.assertEqual(out.channel, "qq")
+        self.assertEqual(out.user, "u")                # 未指定 → 沿用触发 user
+        self.assertEqual(out.session, "s9")            # 未指定 → 沿用触发 session
+
+    async def test_to_decision_parses_route_and_sleep(self):
+        """决策 JSON 的 route / sleep_seconds 解析：非法/空值被稳妥降级。"""
+        mind = self._mind(FakeLLM([("x", None)]))
+        d = mind._to_decision({"action": "speak", "content": "x",
+                               "route": {"channel": "qq"}, "sleep_seconds": 42})
+        self.assertIsNotNone(d.route)
+        self.assertEqual(d.route.channel, "qq")
+        self.assertEqual(d.sleep_seconds, 42.0)
+
+        d2 = mind._to_decision({"action": "speak", "content": "x",
+                                "route": {}, "sleep_seconds": -5})
+        self.assertIsNone(d2.route)                    # 全空 route = 沿用触发来路
+        self.assertEqual(d2.sleep_seconds, 0.0)        # 负数钳制为 0
 
 
 if __name__ == "__main__":

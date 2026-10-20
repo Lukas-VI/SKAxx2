@@ -16,6 +16,10 @@
         ② 频率闸        proactive_max_per_min 滑窗
         ③ 静默退避      连续 max_silent_beats 次沉默 → 跳过若干拍（临时降频）
     另有发送熔断：连续 send_fail_limit 次发送失败则停止主动发送，等 channel_online 恢复。
+
+    自主休眠（阶段三增强）：Mind 决策可携带 sleep_seconds，用来覆盖默认心跳间隔——
+        Agent 能自己决定「接下来睡多久」，但任何输入 / 插件事件都会立即把它唤醒，
+        于是心跳从「唯一的节拍源」降级为「兜底节拍源」（见 _note_sleep / run）。
 """
 from __future__ import annotations
 
@@ -33,6 +37,10 @@ from ..kernel.packet import CoreInput, MindResult
 
 logger = logging.getLogger(__name__)
 
+# Agent 自主休眠的上限（秒）：与 mind.MAX_SLEEP_SECONDS 同量级（此处独立定义，
+# 让 heartbeat 层不依赖 loop 层；24 小时作为兜底，防止把心跳彻底停死）。
+MAX_SLEEP_SECONDS = 86400.0
+
 
 class BeatLoop:
     """心跳循环：装配好之后调用 run() 进入主循环。"""
@@ -47,6 +55,7 @@ class BeatLoop:
         *,
         settings: Any = None,
         policy: Any = None,
+        registry: Any = None,
     ) -> None:
         self.bus = bus
         self.cfg = cfg
@@ -55,12 +64,20 @@ class BeatLoop:
         self.channels = channels
         self.settings = settings      # admin.settings.RuntimeSettings（热改参数；可为 None）
         self.policy = policy          # admin.policy.Policy（白名单校验；可为 None）
+        self.registry = registry      # loop.sessions.SessionRegistry（阶段三多会话；可为 None）
 
         self.beat_count = 0
         self._stop = False
+        # Agent 自主休眠（阶段三增强）：若非 0，则用它替代默认心跳间隔作为下一次 wait 的超时。
+        # 只在「处理完一轮之后」生效——期间任何输入/插件事件都会让 bus.wait 立即返回，
+        # 于是达到了「Agent 自行决定睡多久，但仍可被事件随时唤醒」的效果（心跳仅作兜底）。
+        self._next_sleep = 0.0
 
-        # 主动发言默认走第一个渠道
+        # 主动发言默认走第一个渠道（无历史来路时的兜底）
         self._primary = next(iter(channels), "cli")
+        # 最近一次「用户消息」的来路（渠道/用户/会话/群）。主动发言本身没有来路，
+        # 记住它，才能让机器人主动搭话回到「刚聊过的那个会话」，而不是第一个渠道。
+        self._last_route: dict[str, Any] = {}
 
         # 三重闸参数（先用 config.yaml 的初值；启用后台后由 _refresh 热读覆盖层）
         self._load_from(cfg)
@@ -109,7 +126,11 @@ class BeatLoop:
         logger.info("核心启动：bpm=%d（每拍 %.1fs）", self.bpm, 60 / self.bpm)
         while not self._stop:
             self._refresh()                              # 每拍热读 bpm/闸门参数
-            fired = await self.bus.wait(timeout=60 / self.bpm)
+            # 下一次等待时长：Agent 指定了自主休眠就用它，否则用默认心跳间隔。
+            # 读完后立刻清零——避免这个值被连续几轮沿用（它只对「紧接着的下一轮」有效）。
+            timeout = self._next_sleep if self._next_sleep > 0 else 60 / self.bpm
+            self._next_sleep = 0.0
+            fired = await self.bus.wait(timeout=timeout)
             if self._stop:
                 break
             if fired:
@@ -126,6 +147,55 @@ class BeatLoop:
         self.bus.wakeup()   # 让正在等待的 wait() 立刻返回
 
     # ------------------------------------------------------------------ 事件路径
+    def _ctx_for(self, payload: Any) -> SessionContext:
+        """按输入包选出对应会话的工作记忆窗口（阶段三多会话）。
+
+        装配了 SessionRegistry 时按 (channel:user:session) 路由 —— 于是「怎么通用
+        老渠道不传 session」自动落默认会话，行为与阶段二完全一致；
+        未装配时退回构造时传入的单例 ctx（保持向后兼容）。
+        """
+        if self.registry is not None:
+            try:
+                return self.registry.context_for(payload)
+            except Exception:  # noqa: BLE001 —— 路由失败不能丢消息
+                logger.exception("会话路由失败，回退默认 ctx")
+        return self.ctx
+
+    def _remember_route(self, payload: Any) -> None:
+        """记住最近一次「用户消息」的来路（渠道 / 用户 / 会话 / 群）。
+
+        主动发言（心跳）本身没有来路；若不记住，_pick_trigger 就会退回「第一个渠道」
+        （通常是 cli），于是「在 webchat 聊完，机器人主动搭话却发到了 cli」。
+        记下来路后，_pick_trigger 便可构造一个「同渠道、同会话」的唤醒，
+        回复经由该渠道自然回到原会话（webchat 渠道按 output.session 投递）。
+        """
+        if str(getattr(payload, "source", "")) not in (
+                "cli_message", "qq_message", "webchat_message"):
+            return
+        self._last_route = {
+            "channel": str(getattr(payload, "channel", "") or ""),
+            "user": str(getattr(payload, "user", "") or ""),
+            "user_name": str(getattr(payload, "user_name", "") or ""),
+            "session": str(getattr(payload, "session", "") or ""),
+            "message_type": str(getattr(payload, "message_type", "private") or "private"),
+            "group_id": str(getattr(payload, "group_id", "") or ""),
+        }
+
+    def _note_sleep(self, result: MindResult) -> None:
+        """读取 Agent 在本轮决策里给出的自主休眠时长，记为「下一轮等待时长」。
+
+        语义：sleep_seconds>0 → 覆盖默认心跳节奏，接下来这么久内不主动发声；
+        期间只要有新消息 / 插件事件，bus.wait 会立即返回并把它唤醒（事件优先级最高）。
+        0（或缺失）→ 什么都不做，沿用默认心跳。
+        """
+        try:
+            seconds = float(getattr(result.decision, "sleep_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds > 0:
+            self._next_sleep = min(seconds, MAX_SLEEP_SECONDS)
+            logger.info("Agent 自主休眠 %.0fs（覆盖心跳；期间事件可立即唤醒）", self._next_sleep)
+
     async def _on_events(self, events: list[Event]) -> None:
         """处理一批输入事件（drain 出来的）。"""
         for ev in events:
@@ -142,10 +212,12 @@ class BeatLoop:
                 continue
             # 单个事件处理失败不能拖垮整个心跳循环（日志留痕后继续）
             try:
-                result = await self.mind.wake(self.ctx, ev.payload)
+                self._remember_route(ev.payload)      # 先记下来路，供主动发言回到正确会话
+                result = await self.mind.wake(self._ctx_for(ev.payload), ev.payload)
             except Exception:  # noqa: BLE001
                 logger.exception("处理事件失败，已跳过：topic=%s", ev.topic)
                 continue
+            self._note_sleep(result)                  # Agent 可能要求自主休眠
             await self._deliver(result, proactive=False)
 
     async def _on_channel_status(self, ev: Event) -> None:
@@ -160,7 +232,8 @@ class BeatLoop:
             self._circuit_open = False
             self._send_fails = 0
             logger.info("渠道恢复在线：%s", getattr(payload, "content", ""))
-            result = await self.mind.wake(self.ctx, payload)
+            result = await self.mind.wake(self._ctx_for(payload), payload)
+            self._note_sleep(result)
             await self._deliver(result, proactive=False)
         else:
             self._circuit_open = True
@@ -176,7 +249,8 @@ class BeatLoop:
             return
 
         trigger = await self._pick_trigger()
-        result = await self.mind.wake(self.ctx, trigger)
+        result = await self.mind.wake(self._ctx_for(trigger), trigger)
+        self._note_sleep(result)
 
         if result.output is not None:
             await self._deliver(result, proactive=True)
@@ -190,14 +264,26 @@ class BeatLoop:
                             self.max_silent, self.backoff_factor)
 
     async def _pick_trigger(self) -> CoreInput:
-        """构造本次心跳的触发输入：优先从「可发布白名单」选一个真实目标。
+        """构造本次心跳的触发输入。
 
-        D7：白名单只在配置了目标时生效。未配置（或 QQ 未在线）时，
-        退回阶段一行为——用主渠道发一条私聊式主动消息。
+        优先级（自上而下）：
+            ① 白名单目标（D7：仅 QQ，配置了才走）；
+            ② 最近一次用户消息的来路 —— 让主动发言回到「刚聊过的那个会话」
+               （webchat 多开时尤其重要：不经此步会退回主渠道 cli）；
+            ③ 兜底：主渠道（第一个渠道，通常 cli）私聊式主动消息。
         """
         target = await self._pick_target()
         if target is not None:
             return target
+        route = self._last_route
+        if route.get("channel"):
+            return CoreInput(source="heartbeat", content="心跳唤醒",
+                             channel=route["channel"],
+                             user=route.get("user", ""),
+                             user_name=route.get("user_name", ""),
+                             session=route.get("session", ""),
+                             message_type=route.get("message_type", "private"),
+                             group_id=route.get("group_id", ""))
         return CoreInput(source="heartbeat", content="心跳唤醒", channel=self._primary)
 
     async def _pick_target(self) -> CoreInput | None:

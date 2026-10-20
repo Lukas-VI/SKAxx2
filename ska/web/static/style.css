@@ -154,3 +154,73 @@ pre.out {
 }
 .checkbox { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .checkbox input { width: auto; }
+
+/* ------------------------------------------------------------------ 在线聊天页 */
+.chat-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.chat-tab {
+  padding: 6px 12px; border: 1px solid var(--border); border-radius: 16px;
+  background: #fff; cursor: pointer; font-size: 13px; max-width: 230px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chat-tab:hover { background: #f0f2f6; }
+.chat-tab.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+.chat-tab.active .badge { background: rgba(255, 255, 255, .25); color: #fff; }
+.chat-tab.ghost { color: var(--muted); border-style: dashed; }
+.chat-body { display: flex; flex-direction: column; gap: 10px; }
+.chat-status { display: flex; gap: 8px; flex-wrap: wrap; }
+.chat-log {
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; height: 52vh; min-height: 260px; overflow-y: auto;
+}
+.bubble { margin-bottom: 12px; max-width: 78%; }
+.bubble .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.bubble .txt {
+  padding: 8px 12px; border-radius: 10px; white-space: pre-wrap;
+  word-break: break-word; font-size: 13px;
+}
+.bubble.bot .txt { background: #f0f2f6; }
+.bubble.me { margin-left: auto; text-align: right; }
+.bubble.me .txt { background: var(--primary); color: #fff; text-align: left; }
+.chat-input { display: flex; gap: 10px; align-items: flex-end; }
+.chat-input textarea { flex: 1; min-height: 52px; }
+.chat-input button { flex: 0 0 auto; height: 40px; }
+
+/* ------------------------------------------------------------------ MindLine 泳道 */
+.ml-filters { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 14px; }
+.ml-f { display: flex; flex-direction: column; }
+.ml-f label { margin: 0 0 2px; }
+.ml-f select { width: 180px; }
+.ml-cb { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #4c5566; margin-bottom: 8px; }
+.ml-cb input { width: auto; }
+.ml-wrap { display: flex; gap: 8px; margin-bottom: 18px; }
+.ml-labels { flex: 0 0 96px; }
+.ml-lab {
+  display: flex; align-items: center; justify-content: flex-end; padding-right: 8px;
+  font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border);
+}
+.ml-lab.head { height: 34px; }
+.ml-lab.lane-input, .ml-lab.lane-think, .ml-lab.lane-act { height: 96px; }
+.ml-cols { flex: 1; display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; }
+.ml-col { flex: 0 0 156px; width: 156px; }
+.ml-head {
+  height: 34px; display: flex; align-items: center; gap: 4px; font-size: 12px;
+  color: var(--muted); border-bottom: 1px solid var(--border); overflow: hidden;
+}
+.ml-head small { color: #aab; }
+.ml-cell {
+  height: 96px; overflow-y: auto; padding: 4px; border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 4px; background: var(--panel);
+}
+.ml-cell.empty { background: #fafbfd; }
+.ml-cell.lane-input { border-left: 3px solid #6aa0f0; }
+.ml-cell.lane-think { border-left: 3px solid #c9a24a; }
+.ml-cell.lane-act { border-left: 3px solid #7fbf8f; }
+.ml-chip {
+  padding: 3px 7px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  background: #eef1f6; color: #5a6478; word-break: break-word;
+}
+.ml-chip:hover { background: #e2e7f0; }
+.ml-chip.tool { background: #e6f6ee; color: var(--ok); }
+.ml-chip.err { background: #fdecec; color: var(--danger); }
+.ml-chip .ml-tk { color: var(--muted); font-size: 11px; }
+#ml-detail pre.out { margin-top: 8px; }

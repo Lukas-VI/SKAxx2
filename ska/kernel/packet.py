@@ -20,11 +20,12 @@ from pydantic import BaseModel, Field
 
 # 输入来源枚举（显式声明）
 InputSource = Literal[
-    "cli_message",    # 本地 CLI 输入（默认开发渠道）
-    "qq_message",     # QQ 消息（迁移自老 QQHttpServer）
-    "self_response",  # 机器人自己的输出回灌（保留老 self_response 语义）
-    "system_event",   # 系统事件（启动/关闭/渠道断线重连）
-    "heartbeat",      # 心跳主动唤醒
+    "cli_message",      # 本地 CLI 输入（默认开发渠道）
+    "qq_message",       # QQ 消息（迁移自老 QQHttpServer）
+    "webchat_message",  # WebUI「在线聊天」输入（阶段三：多开会话）
+    "self_response",    # 机器人自己的输出回灌（保留老 self_response 语义）
+    "system_event",     # 系统事件（启动/关闭/渠道断线重连）
+    "heartbeat",        # 心跳主动唤醒
 ]
 
 
@@ -45,12 +46,18 @@ class CoreInput(BaseModel):
     group_id: str = ""                        # 群号（群消息时）
     event: str = ""                           # 系统事件名（source=system_event 时）
     task: str = ""                            # 定时任务名（source=heartbeat 时）
+    # ---- 阶段三：多会话（见方案 §2.2） ----
+    # 会话标识，用于把「同时开着的几个话题」隔离开。
+    # 旧渠道（CLI/QQ）不传 → 空串统一落「默认会话」，行为与阶段二完全一致。
+    session: str = ""
+    # 沙盒标记：persist=false 的在线会话置 True —— 照常推理，但不写任何记忆库。
+    sandbox: bool = False
     ts: float = Field(default_factory=time.time)
     raw: dict[str, Any] = Field(default_factory=dict)  # 原始报文，便于排查
 
     def is_user_message(self) -> bool:
         """是否为真实用户消息（决定是否放行、记忆是否落库）。"""
-        return self.source in ("cli_message", "qq_message")
+        return self.source in ("cli_message", "qq_message", "webchat_message")
 
 
 # 输出目标枚举
@@ -69,6 +76,9 @@ class CoreOutput(BaseModel):
     channel: str = "cli"                      # 走哪个渠道
     user: str = ""                            # 私聊对象
     group_id: str = ""                        # 群号
+    # 阶段三：输出来自哪个会话。webchat 渠道据此把回复投回对应的会话队列；
+    # 旧渠道不传 → 空串，行为不变。
+    session: str = ""
     ts: float = Field(default_factory=time.time)
 
     def is_visible(self) -> bool:
@@ -110,6 +120,28 @@ class AgentResult(BaseModel):
     error: str = ""                            # 执行期错误摘要（可为空）
 
 
+class Route(BaseModel):
+    """Agent 自主指定的「这条输出投递到哪」（阶段三增强）。
+
+    设计取舍：老做法靠「记住上一条用户消息的来路」(_remember_route) 让主动发言
+    回到刚聊过的会话——那是**被动**兜底。但本 Agent 是「并行单实例」的，
+    同时开着多个会话时，她应当能**主动**决定这句话该发到哪个渠道/会话/群。
+    因此让决策模型可选地给出 route：
+        * route 为空（None）→ 沿用触发来路继承（既有行为，向后兼容）；
+        * route 有值 → 优先按它决定 channel / user / session / message_type / group_id。
+    空字段表示「该项沿用触发来路」，便于只覆盖其中一项。
+
+    注：_remember_route 仍是心跳主动路径的兜底（心跳触发本身没有来路），
+        两者并存、互不冲突。
+    """
+
+    channel: str = ""                          # cli / qq / webchat（空=沿用触发来路）
+    user: str = ""                             # 目标用户 id（空=沿用）
+    session: str = ""                          # 目标会话（空=沿用）
+    message_type: str = ""                     # private / group（空=沿用）
+    group_id: str = ""                         # 群号（空=沿用）
+
+
 class Decision(BaseModel):
     """Mind 的决策結果（决策者视角）。"""
 
@@ -119,6 +151,11 @@ class Decision(BaseModel):
     memory: str = ""                           # action=remember 时写入的记忆文本
     importance: float = 0.5                    # 重要性 0~1（记忆排序用）
     reason: str = ""                           # 决策理由（只进日志/内独白）
+    # ---- 阶段三增强：自主路由 + 自主休眠（见方案 §2） ----
+    route: Route | None = None                 # 自主投递目标（None=沿用触发来路）
+    # 自主休眠：Agent 在思考回环里可以决定「接下来 N 秒不主动发声」，
+    # 覆盖默认心跳节奏（心跳仅作兜底）；期间任何输入/插件事件都会立即把它唤醒。
+    sleep_seconds: float = 0.0
 
 
 class MindResult(BaseModel):
@@ -129,3 +166,49 @@ class MindResult(BaseModel):
     agent: AgentResult | None = None           # 执行工具时的执行者结果
     monologue: str = ""                        # 内独白（只进日志/记忆，不进用户输出）
     reflection: str = ""                       # 反思（可选的二次修订说明）
+
+
+# ===========================================================================
+# 三、可观测契约（阶段三 MindLine，见方案 §4.1）
+# ===========================================================================
+# 泳道（lane）：MindLine 页面自上而下的三行，一次交互的每个阶段落在其中一行。
+TraceLane = Literal["input", "think", "act"]
+
+# 事件类型（kind）：决定页面上的图标/配色与筛选维度。
+TraceKind = Literal[
+    "user_msg",      # 收到用户消息
+    "wake",          # 心跳/系统事件唤醒
+    "silence",       # 权限闸拒绝或决定沉默
+    "monologue",     # 内独白
+    "decision",      # 决策结果
+    "degrade",       # 结构化失败降级为纯文本
+    "tool_call",     # 工具调用（参数）
+    "tool_result",   # 工具返回（结果摘要 + 耗时）
+    "reflection",    # 反思（二次修订）
+    "compress",      # 上下文压缩 / 记忆整理
+    "memory_write",  # 写入长期记忆或画像
+    "output",        # 最终输出投递给渠道
+    "error",         # 异常
+]
+
+
+class TraceEvent(BaseModel):
+    """MindLine 的一条轨迹事件。
+
+    设计要点：
+        * `trace_id` 把「同一次交互」的各阶段串成一列（页面按列排）；
+        * `lane` 决定它落在三行中的哪一行；
+        * `seq` 由 TraceLog 统一分配（全局单调递增），前端用 `after=seq` 做增量拉取；
+        * 这是「信号类」事件（走 TOPIC_TRACE），不进入主循环推理。
+    """
+
+    trace_id: str = ""                        # 一次交互的唯一标识
+    seq: int = 0                              # 全局递增序号（由 TraceLog 赋值）
+    ts: float = Field(default_factory=time.time)
+    session: str = ""                         # 所属会话（多开隔离）
+    lane: TraceLane = "think"
+    kind: TraceKind = "monologue"
+    title: str = ""                           # 一行摘要（页面主展示）
+    detail: str = ""                          # 完整细节（点开看）
+    tokens: int = 0                           # 该步涉及的 token 量（上下文占用）
+    sandbox: bool = False                     # 是否沙盒会话（不落库）

@@ -205,6 +205,22 @@ class API:
             # ---- 11. 设置 ----
             R("GET", "/api/settings", self.h_settings, "viewer"),
             R("PUT", "/api/settings", self.h_settings_update, "owner"),
+
+            # ---- 12. 在线聊天（阶段三 §2.4）----
+            # 说明：/api/chat/sessions 与 /api/chat/sessions/{id} 段数不同，
+            # 不会互相吞掉；读接口 viewer、写接口 admin（与后台其他页一致）。
+            R("GET", "/api/chat/meta", self.h_chat_meta, "viewer"),
+            R("GET", "/api/chat/sessions", self.h_chat_sessions, "viewer"),
+            R("POST", "/api/chat/sessions", self.h_chat_create, "admin"),
+            R("PATCH", "/api/chat/sessions/{id}", self.h_chat_update, "admin"),
+            R("DELETE", "/api/chat/sessions/{id}", self.h_chat_delete, "admin"),
+            R("POST", "/api/chat/send", self.h_chat_send, "viewer"),
+            R("GET", "/api/chat/poll", self.h_chat_poll, "viewer"),
+            R("GET", "/api/chat/history", self.h_chat_history, "viewer"),
+
+            # ---- 13. MindLine 轨迹（阶段三 §4.4）----
+            R("GET", "/api/trace", self.h_trace, "viewer"),
+            R("DELETE", "/api/trace", self.h_trace_clear, "admin"),
         ]
 
     # ------------------------------------------------------------------ 分发入口
@@ -302,7 +318,11 @@ class API:
         if isinstance(data.get("app"), dict):
             await self.service.update_settings({"app": data["app"]})
 
-        return Response.json(200, {"ok": True, **result},
+        # 补齐本地私有配置：config/persona.yaml 与 config/providers.yaml 不入库，
+        # 克隆仓库后并不存在，在这里按内置模板/当前提供商生成（已存在则不动）。
+        created = self.service.ensure_local_config()
+
+        return Response.json(200, {"ok": True, "created": created, **result},
                              headers={"Set-Cookie": self._cookie(result["token"])})
 
     async def h_login(self, req: Request, params: dict[str, str]) -> Response:
@@ -516,6 +536,56 @@ class API:
 
     async def h_settings_update(self, req: Request, params: dict[str, str]) -> Response:
         return Response.ok(await self.service.update_settings(req.json()))
+
+    # ================================================================== 在线聊天（阶段三）
+    async def h_chat_meta(self, req: Request, params: dict[str, str]) -> Response:
+        """聊天页状态条元信息（身份/等级/默认落库/轮询间隔/模型窗口）。"""
+        return Response.ok(await self.service.chat_meta())
+
+    async def h_chat_sessions(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"sessions": await self.service.chat_list()})
+
+    async def h_chat_create(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"session": await self.service.chat_create(req.json())})
+
+    async def h_chat_update(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"session": await self.service.chat_update(params["id"], req.json())})
+
+    async def h_chat_delete(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"deleted": await self.service.chat_delete(params["id"])})
+
+    async def h_chat_send(self, req: Request, params: dict[str, str]) -> Response:
+        data = req.json()
+        if not str(data.get("text") or "").strip():
+            raise _APIError(400, "消息内容不能为空")
+        return Response.ok(await self.service.chat_send(data))
+
+    async def h_chat_poll(self, req: Request, params: dict[str, str]) -> Response:
+        session_id = str(req.q("session_id", ""))
+        if not session_id:
+            raise _APIError(400, "缺少 session_id")
+        after = _as_int(str(req.q("after", "0")), 0)
+        return Response.ok(await self.service.chat_poll(session_id, after))
+
+    async def h_chat_history(self, req: Request, params: dict[str, str]) -> Response:
+        session_id = str(req.q("session_id", ""))
+        if not session_id:
+            raise _APIError(400, "缺少 session_id")
+        return Response.ok(await self.service.chat_history(session_id))
+
+    # ================================================================== MindLine 轨迹
+    async def h_trace(self, req: Request, params: dict[str, str]) -> Response:
+        after = _as_int(str(req.q("after", "0")), 0)
+        session = str(req.q("session", ""))
+        limit = _as_int(str(req.q("limit", "300")), 300)
+        events = await self.service.trace_list(after, session, limit)
+        log = self.service.app.get("trace")
+        last_seq = log.last_seq() if log is not None else max(
+            (int(e.get("seq", 0)) for e in events), default=after)
+        return Response.ok({"events": events, "last_seq": last_seq})
+
+    async def h_trace_clear(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"deleted": await self.service.trace_clear()})
 
     # ================================================================== QQ
     async def h_qq_get(self, req: Request, params: dict[str, str]) -> Response:

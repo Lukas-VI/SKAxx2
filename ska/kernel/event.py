@@ -24,6 +24,7 @@ TOPIC_SYSTEM = "system"                # 系统事件（如启动、关闭）
 # 以下主题只通知订阅者，不进入主循环（「信号类」事件）：
 TOPIC_OUTPUT = "output"                # 待发送的 CoreOutput（filter 插件在此拦截）
 TOPIC_HEARTBEAT = "heartbeat"          # 每记一次心跳（观测/统计用）
+TOPIC_TRACE = "trace"                  # MindLine 轨迹事件（阶段三；只落库/广播，不推理）
 
 # 主循环关心的输入类主题集合
 INPUT_TOPICS = frozenset({TOPIC_INPUT, TOPIC_WAKE, TOPIC_CHANNEL_STATUS, TOPIC_SYSTEM})

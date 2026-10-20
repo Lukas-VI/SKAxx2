@@ -27,9 +27,35 @@ logger = logging.getLogger(__name__)
 # 返回值可以是 None（同步）或 coroutine（异步）；网关两种都兼容。
 UsageCallback = Callable[[str, str, dict[str, Any], str], Any]
 
+# 中转「输出被截断」报错体里的特征串（命中即视为可重试的预算不足）。
+# 各家中转措辞不一，这里只匹配可确认语义的片段，避免把普通错误误判为截断。
+_TRUNCATION_MARKERS = (
+    "structured_output_failed",     # 部分中转的结构化输出失败类型
+    "finish_reason=length",         # 文本形式
+    '"finish_reason": "length"',    # JSON 形式（带空格）
+    '"finish_reason":"length"',     # JSON 形式（无空格）
+    "output budget",                # "increase the output budget"
+)
+
+
+def _looks_truncated(text: str) -> bool:
+    """判断一段报错文本是否表示「输出被截断 / 预算不足」。"""
+    low = (text or "").lower()
+    return any(marker in low for marker in _TRUNCATION_MARKERS)
+
 
 class LLMError(RuntimeError):
     """LLM 调用失败（网络/超时/协议错误）。"""
+
+
+class LLMTruncatedError(LLMError):
+    """输出被 max_tokens 截断（finish_reason=length）。
+
+    单独成类的原因：这不是「调用失败」，而是**预算不足**——上层（structured_chat）
+    可以对它做「按 2 倍预算自动重试」，而普通 LLMError（网络/鉴权错）重试无意义。
+    部分 OpenAI 兼容中转会把截断直接当硬错误返回（如 HTTP 502 structured_output_failed），
+    本类同时覆盖「200+finish_reason=length」与「中转报错体含截断特征」两种情形。
+    """
 
 
 class LLMGateway:
@@ -148,13 +174,24 @@ class LLMGateway:
         except asyncio.TimeoutError as e:
             raise LLMError(f"LLM 调用超时（>{self.timeout}s）：{url}") from e
         except httpx.HTTPStatusError as e:
-            raise LLMError(f"LLM 返回错误状态 {e.response.status_code}：{e.response.text[:200]}") from e
+            body = e.response.text or ""
+            # 中转把「结构化输出被截断」当硬错误（如 502 structured_output_failed）时，
+            # 归为可重试的 LLMTruncatedError，让上层自动加预算重试，而不是直接判失败。
+            if _looks_truncated(body):
+                raise LLMTruncatedError(
+                    f"LLM 输出被截断（HTTP {e.response.status_code}）：{body[:200]}") from e
+            raise LLMError(f"LLM 返回错误状态 {e.response.status_code}：{body[:200]}") from e
         except httpx.HTTPError as e:
             raise LLMError(f"LLM 网络错误：{e}") from e
         except json.JSONDecodeError as e:
             raise LLMError("LLM 响应不是合法 JSON") from e
 
         resp = self._parse_response(data)
+        # 200 但被截断：JSON 模式下的输出必然不完整，抛可重试的 LLMTruncatedError，
+        # 由 structured_chat 加预算重试（普通文本模式不抛，保留「截断但可用」的旧行为）。
+        if json_mode and resp.finish_reason == "length":
+            raise LLMTruncatedError(
+                f"LLM 输出被截断（finish_reason=length，max_tokens 不足）：{resp.content[:120]}")
         await self._report_usage(resp, task)    # 用量回调（阶段二；未设置则无操作）
         return resp
 
@@ -192,6 +229,7 @@ class LLMGateway:
             model=data.get("model", self.model),
             usage=data.get("usage", {}) or {},
             raw=message,
+            finish_reason=str(choice.get("finish_reason") or ""),   # 截断检测用
         )
 
     @staticmethod

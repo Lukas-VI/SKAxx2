@@ -86,6 +86,74 @@ class TestMemoryStore(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["long_memory"], 1)
         self.assertEqual(stats["sessions"], 1)
 
+    # ------------------------------------------------------------------ 结构化事实（Mem0 风格）
+    async def test_fact_upsert_dedupes_same_slot(self):
+        """同一 (subject, predicate) 是同一槽位：新值覆盖旧值，不产生重复行。"""
+        self.assertEqual(await self.store.upsert_fact("对方", "喜欢", "酒心巧克力"), "added")
+        self.assertEqual(await self.store.upsert_fact("对方", "喜欢", "牛奶巧克力"), "updated")
+        facts = await self.store.list_facts()
+        self.assertEqual(len(facts), 1)                         # 去重：只剩一行
+        self.assertEqual(facts[0]["object"], "牛奶巧克力")       # 冲突消解：新值覆盖旧值
+        self.assertEqual(facts[0]["updated_count"], 2)          # 更新次数累加
+
+    async def test_fact_importance_takes_max(self):
+        """同槽位合并时重要度取较高者（不让低置信的一次覆盖高置信的）。"""
+        await self.store.upsert_fact("对方", "喜欢", "a", importance=0.9)
+        await self.store.upsert_fact("对方", "喜欢", "b", importance=0.2)
+        facts = await self.store.list_facts()
+        self.assertEqual(facts[0]["importance"], 0.9)
+
+    async def test_fact_search_by_relevance(self):
+        """结构化事实检索按查询 n-gram 相关度召回（中文友好，无需分词）。"""
+        await self.store.upsert_fact("对方", "喜欢", "酒心巧克力", importance=0.6)
+        await self.store.upsert_fact("对方", "住在", "城东", importance=0.6)   # 不同槽位
+        self.assertEqual(await self.store.search_facts("巧克力", top_k=1),
+                         ["对方喜欢酒心巧克力"])
+
+    # ------------------------------------------------------------------ 核心记忆（MemGPT core 风格）
+    async def test_core_pin_list_unpin(self):
+        """核心记忆：pin 幂等、list 可读、unpin 可删。"""
+        await self.store.pin_core("对方叫我小赛")
+        await self.store.pin_core("对方叫我小赛")               # 重复 pin → 幂等
+        self.assertEqual(await self.store.list_core(), ["对方叫我小赛"])
+        self.assertTrue(await self.store.unpin_core("对方叫我小赛"))
+        self.assertEqual(await self.store.list_core(), [])
+
+    async def test_core_global_visible_to_any_user(self):
+        """user='' 写入的核心记忆，对带 user 的检索也可读（单用户陪伴场景）。"""
+        await self.store.pin_core("全局核心记忆", user="")
+        self.assertEqual(await self.store.list_core(user="u1"), ["全局核心记忆"])
+
+    # ------------------------------------------------------------------ 记忆块组装（三层）
+    async def test_recall_block_includes_core_and_facts(self):
+        """记忆块应同时包含「始终记得的核心记忆」与「检索到的结构化事实」。"""
+        from ska.memory.recall import build_memory_block
+
+        await self.store.pin_core("对方叫我小赛")
+        await self.store.upsert_fact("对方", "喜欢", "酒心巧克力", importance=0.7)
+        block = await build_memory_block(self.store, "我最近喜欢吃什么", user="")
+        self.assertIn("你一直记着的事", block)                  # 核心记忆常驻
+        self.assertIn("小赛", block)
+        self.assertIn("酒心巧克力", block)                      # 结构化事实被召回
+
+    async def test_recall_block_empty_when_nothing(self):
+        from ska.memory.recall import build_memory_block
+
+        self.assertEqual(await build_memory_block(self.store, "", user=""), "")
+
+    # ------------------------------------------------------------------ memory_ops 工具
+    async def test_memory_ops_pin_and_unpin(self):
+        """memory_ops 工具支持 pin/unpin，把内容提升/取消为核心记忆。"""
+        from ska.tools.base import ToolDeps
+        from ska.tools.builtin import MemoryOpsTool
+
+        tool = MemoryOpsTool(ToolDeps(store=self.store))
+        msg = await tool.run(action="pin", content="对方讨厌打针")
+        self.assertIn("核心", msg)
+        self.assertEqual(await self.store.list_core(), ["对方讨厌打针"])
+        await tool.run(action="unpin", content="对方讨厌打针")
+        self.assertEqual(await self.store.list_core(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

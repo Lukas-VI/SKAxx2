@@ -96,6 +96,23 @@ CREATE TABLE IF NOT EXISTS tool_permissions (
     min_level TEXT NOT NULL DEFAULT 'member',
     note      TEXT DEFAULT ''
 );
+
+-- 阶段三 MindLine（决策 E4：trace 作为 log 的一部分落库）
+-- seq 由 TraceLog 全局递增分配；session 用于多开会话过滤；sandbox 标注沙盒会话。
+CREATE TABLE IF NOT EXISTS traces (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id  TEXT DEFAULT '',
+    seq       INTEGER NOT NULL DEFAULT 0,
+    ts        REAL NOT NULL,
+    session   TEXT DEFAULT '',
+    lane      TEXT DEFAULT '',
+    kind      TEXT DEFAULT '',
+    title     TEXT DEFAULT '',
+    detail    TEXT DEFAULT '',
+    tokens    INTEGER DEFAULT 0,
+    sandbox   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_traces_seq ON traces(seq);
 """
 
 
@@ -498,7 +515,52 @@ class AdminStore:
         out: dict[str, int] = {}
         with self._lock:
             for table in ("admin_users", "sessions", "settings", "usage",
-                          "chat_users", "publish_targets", "tool_permissions"):
+                          "chat_users", "publish_targets", "tool_permissions", "traces"):
                 out[table] = int(self._conn.execute(
                     f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"])
         return out
+
+    # ================================================================== 轨迹（阶段三 MindLine）
+    async def add_trace(self, *, trace_id: str, seq: int, ts: float, session: str,
+                        lane: str, kind: str, title: str = "", detail: str = "",
+                        tokens: int = 0, sandbox: bool = False) -> None:
+        """写入一条轨迹（TraceLog 调用）。用关键字参数避免十余个位置参数错位。"""
+        await self._call(self._add_trace_sync, trace_id, seq, ts, session, lane,
+                         kind, title, detail, int(tokens), bool(sandbox))
+
+    def _add_trace_sync(self, trace_id: str, seq: int, ts: float, session: str,
+                        lane: str, kind: str, title: str, detail: str,
+                        tokens: int, sandbox: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO traces(trace_id, seq, ts, session, lane, kind,"
+                " title, detail, tokens, sandbox) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (trace_id, int(seq), float(ts), session, lane, kind, title, detail,
+                 int(tokens), 1 if sandbox else 0))
+            self._conn.commit()
+
+    async def list_traces(self, after: int = 0, session: str = "", limit: int = 300) -> list[dict[str, Any]]:
+        """按 seq 增量查询轨迹（供 /api/trace；库侧兜底，页面通常读内存环）。"""
+        return await self._call(self._list_traces_sync, after, session, limit)
+
+    def _list_traces_sync(self, after: int, session: str, limit: int) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM traces WHERE seq > ?"
+        params: list[Any] = [int(after)]
+        if session:
+            sql += " AND session = ?"
+            params.append(session)
+        sql += " ORDER BY seq ASC LIMIT ?"
+        params.append(max(int(limit), 1))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    async def clear_traces(self) -> int:
+        """清空轨迹表（「运行状态」页的清理按钮用），返回删除条数。"""
+        return await self._call(self._clear_traces_sync)
+
+    def _clear_traces_sync(self) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM traces")
+            self._conn.commit()
+        return cur.rowcount
