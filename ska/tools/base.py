@@ -14,6 +14,45 @@ from typing import Any
 
 from ..kernel.registry import TOOL_REGISTRY
 
+# 解码候选顺序：先声明的（如网页 meta charset），再 UTF-8，最后 GB18030。
+# 选 GB18030 而不是 GBK：它是 GBK/GB2312 的超集，能多认一批生僻字。
+_DECODE_FALLBACKS = ("utf-8", "gb18030")
+
+
+def decode_bytes(raw: bytes, *, preferred: str = "") -> str:
+    """把「来源编码未知」的字节流解码成文本（Windows 中文乱码的统一出口）。
+
+    背景：Windows 下子进程/中文站点大量使用 GBK(CP936)，而本项目其余链路全是
+    UTF-8。若直接 `decode("utf-8")`，中文就会变成 `ϵͳ�Ҳ���...` 这类乱码；
+    反过来直接按 GBK 解码又会把正常的 UTF-8 文本解坏。所以按「声明编码 →
+    UTF-8 → GB18030」逐个严格尝试，全都失败才带替换符兜底（保证不抛异常）。
+    """
+    data = raw or b""
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.extend(_DECODE_FALLBACKS)
+    for encoding in candidates:
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue                      # 该编码解不通 → 换下一个
+    return data.decode("utf-8", errors="replace")
+
+
+def decode_output(raw: bytes) -> str:
+    """解码子进程输出：**逐行**尝试编码，兼容同一条输出里 UTF-8 与 GBK 混排。
+
+    为什么不能整段解一次：Windows 上 cmd.exe 自身的提示是 GBK，而被执行的
+    Python/其它程序（尤其我们注入了 PYTHONIOENCODING=utf-8 之后）输出 UTF-8。
+    两种字节混在同一段里，无论整段按哪个编码都会把另一半解成乱码；
+    逐行处理则每行各自挑能解通的编码，两种来源都能正确显示。
+    安全性：UTF-8 的多字节序列里不会出现 0x0A，按行切分不会切断字符。
+    """
+    if not raw:
+        return ""
+    return "".join(decode_bytes(line) for line in raw.splitlines(keepends=True))
+
 
 @dataclass
 class ToolDeps:

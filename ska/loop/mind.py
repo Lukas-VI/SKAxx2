@@ -4,13 +4,14 @@
     ⓪ 权限闸（登记用户 / 拉黑拦截）
     ① 记忆召回（profile + FTS + 最近摘要，见 memory/recall.py）
     ⓵ 上下文组装（ContextBuilder → ContextPlan；接近窗口上限则压缩 + 记忆整理）
-    ② 内独白（LLM，只进日志/记忆，不进用户输出）
-    ③ 决策（LLM 结构化输出 → Decision：silence / speak / remember / tool）
-    ④ 需要工具则交 AgentLoop 执行 think→act→observe
-    ⑤ 反思（按长度/重要性触发二次修订，Reflexion）
-    ⑥ 组装 MindResult（speak 走 CoreOutput 路由；remember 落库）
-    ⑦ 会话边界判定 → 后台摘要 + 画像抽取
-    ⑧ 返回，交给心跳循环回到 bus.wait
+    ② 决策（LLM 结构化输出 → Decision：silence / speak / remember / tool / sticker / think）
+       └ action=think 时先做一次显式内独白（只进日志/记忆，不进用户输出），再决策一次；
+       默认不跑独白，避免每轮都多付一次模型调用（简单对话响应更快）
+    ③ 需要工具则交 AgentLoop 执行 think→act→observe
+    ④ 反思（按长度/重要性触发二次修订，Reflexion）
+    ⑤ 组装 MindResult（speak 走 CoreOutput 路由；remember 落库）
+    ⑥ 会话边界判定 → 后台摘要 + 画像抽取
+    ⑦ 返回，交给心跳循环回到 bus.wait
 
 阶段三新增（见方案 §2.3 / §3.3 / §4.2）：
     * 多会话：trigger.session 决定窗口路由（由 BeatLoop 用 SessionRegistry 传入 ctx）；
@@ -52,8 +53,10 @@ HISTORY_LIMIT = 12
 COMPRESS_KEEP_MIN = 2
 # Agent 自主休眠上限（秒）：防止模型给出离谱数值把心跳彻底停死（24 小时兜底）
 MAX_SLEEP_SECONDS = 86400.0
+# 对话窗口合批后，一轮最多解析多少张图/表情（按批大小放宽，但设绝对上限）
+MAX_BATCH_IMAGES = 16
 
-_VALID_ACTIONS = {"speak", "silence", "remember", "tool"}
+_VALID_ACTIONS = {"speak", "silence", "remember", "tool", "sticker", "think"}
 
 
 def format_history(msgs: list[Message]) -> str:
@@ -84,10 +87,13 @@ class Mind:
         policy: Any = None,
         bus: Any = None,
         builder: Any = None,
+        stickers: Any = None,
     ) -> None:
         self.gateway = gateway
         self.agent = agent            # AgentLoop
         self.store = store            # MemoryStore（可为 None：无记忆也能跑）
+        # 表情包/图片解析器（media.stickers.StickerBook；None=不解析来图、不发图）
+        self.stickers = stickers
         self.summarizer = summarizer  # Summarizer（可为 None）
         self.cfg = cfg
         self.policy = policy          # admin.policy.Policy（阶段二；可为 None=不裁权限）
@@ -97,6 +103,8 @@ class Mind:
         self.builder = builder        # ContextBuilder（阶段三；可为 None=退回阶段二行为）
         self.mem_cfg = cfg.memory if cfg else {}
         self.llm_retry = int((cfg.llm if cfg else {}).get("retry", 1))
+        # 图片/表情相关配置（顶层 media 小节）：发图上限、视觉开关、表情包目录都在这里
+        self.media_cfg = cfg.section("media") if cfg else {}
 
     # ------------------------------------------------------------------ 人设热更新
     def refresh_persona(self) -> None:
@@ -141,6 +149,12 @@ class Mind:
             await emit_trace(self.bus, lane="input", kind="wake",
                              title=f"唤醒（{trigger.source}）", detail=trigger.content, **tb)
 
+        # ⓪.5 来图解析（阶段四）：先让视觉模型把图片/表情包读成一句可读描述。
+        #    * 表情包首次出现 → 视觉解析 + 存本地表情库；重复出现直接命中缓存（省一次模型调用）；
+        #    * 普通照片 → 只描述、不入库（它不是「可复用的表情」）。
+        # 解析结果要拼进「对方说」的描述里，否则决策模型根本看不见图片内容。
+        image_notes = await self._analyze_images(trigger, **tb)
+
         # ① 记忆召回
         memory_block = ""
         if self.store:
@@ -149,8 +163,12 @@ class Mind:
 
         # 记录用户输入到工作记忆（+ 原始流水落库；沙盒会话不落库）
         if trigger.is_user_message():
-            ctx.add("user", f"{trigger.user_name or trigger.user}: {trigger.content}")
-            await self._persist("user", trigger.content, trigger)
+            # 图片描述与原文合并成一条「用户说了什么」，后续召回/摘要都能看到图片语义
+            user_text = trigger.content
+            if image_notes:
+                user_text = f"{user_text}（{'；'.join(image_notes)}）"
+            ctx.add("user", f"{trigger.user_name or trigger.user}: {user_text}")
+            await self._persist("user", user_text, trigger)
 
         # ⓵ 上下文组装 + 需要时压缩（阶段三 §3.3）
         plan = self._build_plan(ctx, memory_block)
@@ -159,31 +177,73 @@ class Mind:
         recent = (plan.render_history() if plan is not None
                   else format_history(ctx.recent(HISTORY_LIMIT)))
         tokens = plan.used_tokens if plan is not None else 0
-        desc = self._describe(trigger)
+        desc = self._describe(trigger, image_notes)
 
         # 可用工具集（阶段三增强）：必须在决策之前算好——决策 LLM 得先「知道自己有什么工具」，
         # 否则它永远只会选 speak / silence，压根想不到 action=tool（这是「工具感知」的关键）。
         allow = await self.policy.tools_for(trigger) if self.policy is not None else None
         catalog = self._tool_catalog(allow)
+        # 表情包清单（阶段四）：把本地库的「含义关键词」摘要塞进决策提示词，
+        # 否则模型不知道手里有哪些表情包，自然也不会选 action=sticker。
+        sticker_hint = await self._sticker_hint()
 
-        # ② 内独白
-        monologue = await self._monologue(desc, recent)
-        if monologue:
-            await emit_trace(self.bus, lane="think", kind="monologue",
-                             title="内心独白", detail=monologue, **tb)
+        # ② 决策（默认不再每轮先跑一次独白：独白本身是一次完整模型调用，
+        #    绝大多数简单对话（打招呼、接梗、查时间）根本用不上它，白白多等一轮。）
+        decision, degrade = await self._decide_with_trace(desc, recent, "", memory_block,
+                                                          tokens, tb, catalog, sticker_hint)
 
-        # ③ 决策
-        decision, degrade = await self._decide_with_trace(desc, recent, monologue,
-                                                          memory_block, tokens, tb, catalog)
+        # ②.5 显式思考（action=think）：把「内心独白」降级成一种可选动作。
+        # 只有决策模型自己判断「场面复杂 / 拿不准 / 对话无聊需要重新打量」时，
+        # 才愿意多花一次调用；思考完再决策一次，且只允许思考一次，避免无限自省。
+        monologue = ""
+        if decision.action == "think" and not degrade:
+            monologue = await self._monologue(desc, recent,
+                                              focus=decision.content or decision.reason)
+            if monologue:
+                await emit_trace(self.bus, lane="think", kind="monologue",
+                                 title="内心独白（显式思考）", detail=monologue, **tb)
+            decision, degrade = await self._decide_with_trace(
+                desc, recent, monologue, memory_block, tokens, tb, catalog, sticker_hint)
+            if decision.action == "think":
+                # 想完了还在「再想想」＝没有结论：保持沉默，别把循环拖进死胡同
+                decision = Decision(action="silence", reason="显式思考后仍未得出结论")
 
         # ④ 工具执行（allow 已在上方算好；非用户消息路径为 None=不裁剪）
         agent_result = None
         content = decision.content
+        # 待发图片：决策里显式给的（如代码刚画好的 PNG）+ 工具链里 image_send 附带的
+        images: list[str] = list(getattr(decision, "images", None) or [])
         if decision.action == "tool":
             agent_result = await self.agent.run(
                 self._agent_context(ctx, memory_block, plan), first=decision.tool, allow=allow,
                 trace_id=trace_id, session=session, sandbox=sandbox)
             content = agent_result.final
+            # 工具链产出的图片（image_send 的 [[IMAGE:...]] 标记已被 AgentLoop 剥离，
+            # 统一收进 AgentResult.images），这里并入本轮输出，渠道会自动组装 image 段。
+            images.extend(getattr(agent_result, "images", None) or [])
+            # 截断反馈（阶段三增强）：执行者被 max_steps / 死循环终止时必须留痕，
+            # 让后台 MindLine 与日志都看得到「为什么没做完」，而不是静默无输出。
+            if agent_result.stopped:
+                await emit_trace(self.bus, lane="act", kind="error",
+                                 title=f"工具链截断（{agent_result.stop_reason or 'max_steps'}）",
+                                 detail=(f"steps={len(agent_result.steps)}，"
+                                         f"final={agent_result.final[:200]}"), **tb)
+
+        # ④.5 表情包行动（阶段四）：先查本地表情库，命中就发表情包；没有命中则退化为 speak。
+        # 关键取舍：这里**只查本地**，不让决策模型现场联网搜——发表情包必须是「秒回」的，
+        # 联网检索留给 Agent 主动调 giphy_search 工具（多步、可解释）。
+        if decision.action == "sticker":
+            picked = await self._pick_sticker(decision, trigger, **tb)
+            if picked:
+                images = [picked] + images
+                # 命中表情包就**不再发文字**：模型常会顺手写一句配文，但「表情包 + 一句话」
+                # 看起来像在解释自己，反而把气氛弄僵。纯表情包才是真的「发表情」。
+                content = ""
+            else:
+                # 本地没有合适的表情包 → 退化为普通发言（prompt 要求此时 content 已有兜底文案）。
+                decision.action = "speak"
+                if not decision.reason:
+                    decision.reason = "本地无合适表情包，退化为 speak"
 
         # ⑤ 反思（仅对真实用户消息做质量把关，省下主动路径的调用）
         reflection = ""
@@ -196,16 +256,20 @@ class Mind:
         # ⑥ 组装输出
         output: CoreOutput | None = None
         final_text = content.strip()
-        if decision.action in ("speak", "tool") and final_text:
-            output = self._to_output(final_text, trigger, decision)
+        # 注意条件里的 `or images`：只发一张表情包（没有配文）也是合法输出；
+        # 若仍按「必须有文本」判断，agent 就永远发不出纯表情包。
+        if decision.action in ("speak", "tool", "sticker") and (final_text or images):
+            output = self._to_output(final_text, trigger, decision, images)
             # 多会话：让 webchat 渠道能投回本会话。若 Agent 已用 route 显式指定目标会话，
             # 则尊重它的选择，不再用触发会话覆盖（阶段三增强：自主路由）。
             if not (decision.route and decision.route.session):
                 output.session = session
-            ctx.add("assistant", output.content)
-            await self._persist("assistant", output.content, trigger)
+            if output.content:                 # 纯图片时没有文本，不必往记忆里塞空消息
+                ctx.add("assistant", output.content)
+                await self._persist("assistant", output.content, trigger)
             await emit_trace(self.bus, lane="act", kind="output",
-                             title=f"输出 → {output.channel}", detail=output.content,
+                             title=f"输出 → {output.channel}",
+                             detail=output.content or f"[图片 x{len(output.images)}]",
                              tokens=tokens, **tb)
 
         # action=remember：写入长期记忆（不回话；沙盒会话不写）
@@ -272,13 +336,20 @@ class Mind:
                              trace_id=trace_id, session=session, sandbox=sandbox)
         return self._build_plan(ctx, memory_block)     # 重建上下文
 
-    # ------------------------------------------------------------------ ② 内独白
-    async def _monologue(self, desc: str, recent: str) -> str:
+    # ------------------------------------------------------------------ ②.5 显式思考
+    async def _monologue(self, desc: str, recent: str, focus: str = "") -> str:
+        """执行一次内心独白（仅当决策选了 action=think）。
+
+        focus：决策里给出的「想先想清楚什么」，让这次思考不跑题；
+        为空时退回原来「评估要不要回应 / 真实感受」的通用问法。
+        """
+        user_text = prompts.MONOLOGUE_USER.format(input_desc=desc, recent=recent)
+        if focus.strip():
+            user_text += f"\n\n你想先想清楚的是：{focus.strip()}"
         try:
             resp = await self.gateway.chat([
                 ChatMessage(role="system", content=f"{self.system}\n\n{prompts.MONOLOGUE_SYSTEM}"),
-                ChatMessage(role="user", content=prompts.MONOLOGUE_USER.format(
-                    input_desc=desc, recent=recent)),
+                ChatMessage(role="user", content=user_text),
             ], task="monologue")
         except LLMError as e:
             logger.warning("内独白调用失败：%s", e)
@@ -288,16 +359,21 @@ class Mind:
     # ------------------------------------------------------------------ ③ 决策
     async def _decide_with_trace(self, desc: str, recent: str, monologue: str,
                                  memory_block: str, tokens: int,
-                                 tb: dict[str, Any], catalog: str = "") -> tuple[Decision, bool]:
+                                 tb: dict[str, Any], catalog: str = "",
+                                 sticker_hint: str = "") -> tuple[Decision, bool]:
         """执行决策并 emit 轨迹；返回 (decision, 是否发生了降级)。
 
         catalog：本轮可用工具清单（名字 + 说明）。注入决策提示词，让模型「知道自己有什么工具」。
+        sticker_hint：本地表情包库的语义摘要。为空表示没有可用表情包（或未启用）。
         """
         tools_block = (f"\n\n【你可用的工具（action=tool 时从中选）】\n{catalog}"
                        if catalog else "\n\n【你可用的工具】\n（本轮没有可用工具）")
+        # 表情包清单同样要「先让模型看见」：模型不知道库里有啥，就永远不会选 sticker。
+        sticker_block = (f"\n\n【你收藏的表情包（action=sticker 时用其中含义作检索词）】\n{sticker_hint}"
+                         if sticker_hint else "\n\n【你收藏的表情包】\n（本地库暂无表情包）")
         user_text = prompts.DECISION_USER.format(
-            monologue=monologue or "（没想太多）", input_desc=desc, recent=recent,
-            tools=tools_block)
+            monologue=monologue or "（这一轮没有先做独白，直接决策）", input_desc=desc, recent=recent,
+            tools=tools_block, stickers=sticker_block)
         if memory_block:
             user_text += f"\n\n【你想起的旧事】\n{memory_block}"
         msgs = [
@@ -360,11 +436,28 @@ class Mind:
             content=str(data.get("content") or ""),
             tool=tool,
             memory=str(data.get("memory") or ""),
+            # 表情包检索词：模型有时会把整句话塞进来，这里只做去空白，不做截断——
+            # 检索用 2-gram 相关度打分，长句也能命中（只是排序更依赖关键词密度）。
+            sticker=str(data.get("sticker") or "").strip(),
+            images=self._to_images(data.get("images")),
             importance=importance,
             reason=str(data.get("reason") or ""),
             route=self._to_route(data.get("route")),
             sleep_seconds=self._to_sleep(data.get("sleep_seconds")),
         )
+
+    @staticmethod
+    def _to_images(raw: Any) -> list[str]:
+        """把决策里的 images 稳妥地转成字符串列表（兼容字符串/列表/None）。
+
+        安全边界：这里**只做类型归一**，真正的路径白名单校验在渠道层（media/images.py）
+        与 AgentLoop 的工具层完成——决策模型不该拥有「任意读写本地文件」的权力。
+        """
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if str(x or "").strip()]
 
     @staticmethod
     def _to_route(raw: Any) -> Route | None:
@@ -424,7 +517,8 @@ class Mind:
 
     # ------------------------------------------------------------------ 组装/落库
     def _to_output(self, content: str, trigger: CoreInput,
-                   decision: Decision | None = None) -> CoreOutput:
+                   decision: Decision | None = None,
+                   images: list[str] | None = None) -> CoreOutput:
         """决定输出目标：优先用 Agent 自主指定的 route，缺省沿用触发来路（兼容旧行为）。
 
         路由优先级：decision.route（逐字段覆盖） > 触发来路（trigger）。
@@ -448,7 +542,9 @@ class Mind:
         if message_type == "group" and channel == "qq":
             target = "group_msg"
         return CoreOutput(content=content, target=target,         # type: ignore[arg-type]
-                          channel=channel, user=user, group_id=group_id, session=session)
+                          channel=channel, user=user, group_id=group_id, session=session,
+                          # 图片由渠道层统一转成平台消息段（QQ: image 段，webchat: 附件列表）
+                          images=list(images or []))
 
     async def _persist(self, role: str, content: str, trigger: CoreInput) -> None:
         """把真实对话写入 messages 表（工作记忆的持久化备份）。
@@ -498,6 +594,98 @@ class Mind:
             lines.append(f"- {name}：{desc[0] if desc else '（无说明）'}")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------ 图片/表情包（阶段四）
+    async def _analyze_images(self, trigger: CoreInput, *, trace_id: str,
+                              session: str, sandbox: bool) -> list[str]:
+        """解析本条输入携带的图片/表情包，返回可读描述列表（失败条目直接跳过）。
+
+        性能/成本取舍：
+            * 表情包首次出现才跑视觉；重复出现走 sha256 缓存（StickerBook 内部保证）；
+            * 每条消息最多解析 max_images_per_message 张，防止一次刷几十张图拖垮一轮推理；
+            * 解析失败（下载失败/模型不可用）只丢这一张，绝不影响正常回话。
+        """
+        raw = list(getattr(trigger, "images", None) or [])
+        if not raw:
+            return []
+        limit = int(self.media_cfg.get("max_images_per_message", 4) or 0)
+        limit = limit if limit > 0 else 4
+        # 对话窗口合批后，一个 trigger 里可能并着好几条消息的图/表情：
+        # 若仍按「单条消息」的上限截断，窗口后半段的表情包就永远解析不到、
+        # 也进不了表情库（这正是「回复期间发的表情包没被截到」的直接原因）。
+        # 这里按批内消息数放宽，但设绝对上限，防止一次刷几十张图拖垮推理。
+        batch = int((getattr(trigger, "raw", None) or {}).get("_batch", 1) or 1)
+        if batch > 1:
+            limit = min(limit * batch, MAX_BATCH_IMAGES)
+        notes: list[str] = []
+        for image in raw[:limit]:
+            # 未启用表情包/视觉能力时，至少让模型知道「对方发了图」，而不是当作没发
+            if self.stickers is None:
+                notes.append(str(image.get("summary") or "对方发来一张图片（未启用视觉解析）"))
+                continue
+            try:
+                note = await self.stickers.analyze(
+                    image, user=trigger.user, channel=trigger.channel)
+            except Exception:  # noqa: BLE001 —— 单张图解析失败不能打断整轮对话
+                logger.exception("图片解析失败")
+                note = ""
+            if note:
+                notes.append(note)
+        if notes:
+            await emit_trace(self.bus, lane="input", kind="image",
+                             title=f"图片解析：{len(notes)} 张",
+                             detail="；".join(notes), trace_id=trace_id,
+                             session=session, sandbox=sandbox)
+        return notes
+
+    async def _sticker_hint(self) -> str:
+        """把本地表情包库的「含义摘要」压缩成几行，注入决策提示词。
+
+        只列 description/tags、且必须**有本地文件**：没有文件的内置表情发不出去，
+        列出来只会诱导模型选 sticker 然后必然退化。
+        """
+        if self.stickers is None:
+            return ""
+        try:
+            limit = int(self.media_cfg.get("sticker_catalog_size", 12) or 12)
+            rows = await self.stickers.list(max(min(limit, 30), 1))
+        except Exception:  # noqa: BLE001 —— 提示词增强失败就当没有表情包
+            logger.debug("读取表情包清单失败", exc_info=True)
+            return ""
+        lines: list[str] = []
+        for row in rows:
+            if not str(row.get("file") or "").strip():
+                continue
+            desc = str(row.get("description") or "").strip()
+            tags = str(row.get("tags") or "").strip()
+            text = desc or tags
+            # 标签单独标注：决策模型的 sticker 字段是「按标签检索」的，
+            # 把标签混在描述括号里容易被它当成一句话而照抄错。
+            if tags and tags not in desc:
+                text = f"{text}｜标签：{tags}" if text else f"标签：{tags}"
+            if text:
+                lines.append(f"- {text}")
+        return "\n".join(lines)
+
+    async def _pick_sticker(self, decision: Decision, trigger: CoreInput, *,
+                            trace_id: str, session: str, sandbox: bool) -> str:
+        """按决策里的检索词从本地库挑一张表情包；返回本地文件路径（无命中返回空串）。"""
+        if self.stickers is None:
+            return ""
+        # 检索词为空时用触发文本兜底——模型偶尔只给 action=sticker 不给 sticker 字段
+        query = (decision.sticker or trigger.content or "").strip()
+        try:
+            row = await self.stickers.pick(query, user=trigger.user)
+        except Exception:  # noqa: BLE001 —— 检索失败等同「没有合适的表情包」
+            logger.exception("表情包检索失败")
+            return ""
+        path = str((row or {}).get("file") or "").strip()
+        if not path:
+            return ""
+        await emit_trace(self.bus, lane="act", kind="sticker",
+                         title=f"发表情包：{query[:20] or '（最近常用）'}",
+                         detail=path, trace_id=trace_id, session=session, sandbox=sandbox)
+        return path
+
     # ------------------------------------------------------------------ 工具上下文
     def _agent_context(self, ctx: SessionContext, memory_block: str,
                        plan: Any = None) -> list[ChatMessage]:
@@ -515,12 +703,23 @@ class Mind:
 
     # ------------------------------------------------------------------ 输入描述
     @staticmethod
-    def _describe(trigger: CoreInput) -> str:
-        """把触发输入转成一句给 LLM 看的「当前情况」。"""
+    def _describe(trigger: CoreInput, image_notes: list[str] | None = None) -> str:
+        """把触发输入转成一句给 LLM 看的「当前情况」。
+
+        image_notes：来图的视觉描述（Mind 已解析）。既可以是表情包含义，也可以是照片内容，
+        统一拼在正文后面，让决策模型「看得见图」。
+        """
         if trigger.source in ("cli_message", "qq_message", "webchat_message"):
             who = trigger.user_name or trigger.user or "对方"
             where = "（群里）" if trigger.message_type == "group" else ""
-            return f"{who}{where}说：{trigger.content}"
+            text = trigger.content
+            if image_notes:
+                text = f"{text}〔图片：{'；'.join(image_notes)}〕"
+            if int((trigger.raw or {}).get("_batch", 1) or 1) > 1:
+                # 对话窗口合并批：每行已经带「谁：内容」，再套一句「某某说」会读成
+                # 「小明说：小明：…」，所以这里换一种说法。
+                return f"{who}{where}连续发来几条消息：\n{text}"
+            return f"{who}{where}说：{text}"
         if trigger.source == "heartbeat":
             task = f"，任务：{trigger.task}" if trigger.task else ""
             return (f"（心跳主动唤醒{task}）现在没有新的用户消息，"

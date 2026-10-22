@@ -35,8 +35,16 @@ async def emit_trace(bus: Any, *, trace_id: str, session: str, lane: str, kind: 
     """
     if bus is None:
         return None
-    event = TraceEvent(trace_id=trace_id, session=session, lane=lane, kind=kind,  # type: ignore[arg-type]
-                       title=title, detail=detail, tokens=tokens, sandbox=sandbox)
+    try:
+        event = TraceEvent(trace_id=trace_id, session=session, lane=lane,  # type: ignore[arg-type]
+                           kind=kind, title=title, detail=detail,
+                           tokens=tokens, sandbox=sandbox)
+    except Exception as e:  # noqa: BLE001
+        # 轨迹是**旁路观测**：一个拼错的 kind/lane 不该让整轮对话被跳过。
+        # 这里降级为「这条轨迹丢掉 + 告警」，与 TraceLog.write 的落库容错同一原则。
+        logger.warning("轨迹事件不合法，已跳过（lane=%s, kind=%s）：%s",
+                       lane, kind, e)
+        return None
     await bus.emit(TOPIC_TRACE, event)
     return event
 

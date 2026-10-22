@@ -9,10 +9,11 @@
 <body>
   <!-- 单页应用容器：登录/初始化界面与主界面都由 app.js 动态渲染 -->
   <div id="app">加载中…</div>
-  <!-- 两个扩展页脚本先于 app.js 加载：它们把页对象注册进 window.EXTRA_PAGES，
+  <!-- 扩展页脚本先于 app.js 加载：它们把页对象注册进 window.EXTRA_PAGES，
        由 app.js 末尾统一并入导航（见 app.js 中 PAGES 之后的合并逻辑）。 -->
   <script src="/static/chat.js"></script>
   <script src="/static/mindline.js"></script>
+  <script src="/static/stickers.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

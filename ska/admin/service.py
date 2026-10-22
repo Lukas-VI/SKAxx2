@@ -12,18 +12,39 @@
 """
 from __future__ import annotations
 
-import asyncio
-import importlib
+import base64
+import binascii
 import logging
-import pkgutil
 from pathlib import Path
 from typing import Any
 
 from ..io.onebot import OneBotClient, OneBotError
 from ..kernel.config import load_yaml, write_persona_default
+from ..llm.gateway import LLMError
+from ..llm.models import ChatMessage
+from ..llm.structured import StructuredError, structured_chat
 from .policy import LEVELS
 
 logger = logging.getLogger(__name__)
+
+# 结构化事实抽取提示词：把一段领域知识拆成原子三元组（同槽位可覆盖更新）。
+FACT_EXTRACT_SYSTEM = """你是知识库结构化助手。把用户提供的领域知识拆成尽量细的原子事实：
+- subject：主体（实体名，尽量用名词）；
+- predicate：关系或属性（短词，如「属于」「位于」「成分」「适合」）；
+- object：客体或值；
+- fact：一句完整的中文陈述；
+- importance：0~1 的重要性。
+要求：一条事实只表达一件事；同一主体的同类关系尽量用同一个 predicate。
+只输出 JSON，不要解释：
+{"facts":[{"subject":"","predicate":"","object":"","fact":"","importance":0.6}]}"""
+
+
+def _decode_upload(data: str) -> bytes:
+    """解码前端上传的图片：支持裸 base64 与 data:image/...;base64,xxx 两种。"""
+    raw = str(data or "").strip()
+    if raw.startswith("data:") and "," in raw:
+        raw = raw.split(",", 1)[1]                # 去掉 data URL 头
+    return base64.b64decode(raw, validate=False)
 
 
 class AdminService:
@@ -163,61 +184,90 @@ class AdminService:
             channel.hub = hub
 
     # ================================================================== 插件
-    def _available_plugins(self) -> list[str]:
-        """枚举 ska/plugins 下的可用插件模块（排除 __init__）。"""
-        pkg = importlib.import_module("ska.plugins")
-        return sorted(info.name.rsplit(".", 1)[-1]
-                      for info in pkgutil.iter_modules(pkg.__path__)
-                      if not info.name.startswith("_"))
+    def _plugin_manager(self) -> Any:
+        """取插件运行时管理器（main.build() 已建好；测试里缺就惰性补一个）。"""
+        manager = self.app.get("plugin_manager")
+        if manager is None:
+            from ..plugins.manager import PluginManager
+            manager = PluginManager(self.app, settings=self.settings, store=self.store)
+            self.app["plugin_manager"] = manager
+        return manager
 
     async def list_plugins(self) -> list[dict[str, Any]]:
-        enabled = set(self.settings.names("plugins"))
-        loaded = set(self.app.get("plugin_map", {}))
-        return [{"name": name, "enabled": name in enabled, "loaded": name in loaded}
-                for name in self._available_plugins()]
+        return self._plugin_manager().describe()
 
     async def toggle_plugin(self, name: str, enabled: bool) -> dict[str, Any]:
         """启停插件：写设置 + 立即装载/卸载（scheduler 等可在运行期安全启停）。"""
-        if name not in self._available_plugins():
-            raise ValueError(f"未知插件：{name}")
-        names = self.settings.names("plugins")
-        if enabled and name not in names:
-            names.append(name)
-        if not enabled and name in names:
-            names.remove(name)
+        return await self._plugin_manager().toggle(name, enabled)
+
+    async def reload_plugin(self, name: str) -> dict[str, Any]:
+        """热重载：重新读取磁盘源码并重新装载（改完插件文件后一键生效）。"""
+        manager = self._plugin_manager()
+        await manager.reload(name)
+        return {"name": name, "loaded": name in manager.loaded(),
+                "plugins": manager.describe()}
+
+    async def delete_plugin(self, name: str) -> dict[str, Any]:
+        """卸载并删除插件文件（内置插件受保护，会抛错）。"""
+        manager = self._plugin_manager()
+        await manager.delete(name)
+        return {"name": name, "deleted": True, "plugins": manager.describe()}
+
+    async def create_plugin(self, name: str, source: str,
+                            *, enabled: bool = True) -> dict[str, Any]:
+        """新建/覆写插件源码并热装载（WebUI「新建插件」用）。"""
+        manager = self._plugin_manager()
+        result = await manager.create(name, source, enabled=enabled)
+        return {**result, "plugins": manager.describe()}
+
+    async def plugin_source(self, name: str) -> dict[str, Any]:
+        """读取插件源码（后台编辑框「载入」用；只读，不改状态）。"""
+        return {"name": name, "source": self._plugin_manager().read_source(name)}
+
+    async def plugin_settings(self, name: str) -> dict[str, Any]:
+        """读取插件设置项：schema（前端据此生成表单）+ 当前生效值 + 可选值。
+
+        「可选值」只对 type=targets 的字段生成：取自可发布目标表，外加 QQ 默认群
+        （默认消息通道就是群聊，即使还没登记成可发布目标也应能选）。
+        """
+        manager = self._plugin_manager()
+        schema = manager.settings_schema(name)
+        if not schema:
+            return {"name": name, "schema": {}, "values": {}, "options": {}}
+        values = manager.default_settings(schema)
+        if self.settings is not None:
+            values.update(self.settings.section(f"plugin:{name}"))
+        options: dict[str, Any] = {}
+        if any(str(f.get("type")) == "targets" for f in schema.get("fields") or []):
+            rows = await self.store.list_targets() if self.store is not None else []
+            items = [{
+                "value": f"{r.get('channel')}|{r.get('target_type')}|{r.get('target_id')}",
+                "label": (f"{r.get('name') or r.get('target_id')}"
+                          f"（{r.get('channel')}·{'群' if r.get('target_type') == 'group' else '好友'}）"),
+            } for r in rows if r.get("enabled", 1)]
+            seen = {item["value"] for item in items}
+            group = str((self.settings.qq() if self.settings is not None else {})
+                        .get("default_group") or "").strip()
+            if group and f"qq|group|{group}" not in seen:
+                items.insert(0, {"value": f"qq|group|{group}",
+                                 "label": f"{group}（qq·群·默认）"})
+            options["targets"] = items
+        return {"name": name, "schema": schema, "values": values, "options": options}
+
+    async def update_plugin_settings(self, name: str,
+                                     values: dict[str, Any]) -> dict[str, Any]:
+        """保存插件设置项（校验 → 写库 → 热重载插件，使其立即按新值工作）。"""
+        manager = self._plugin_manager()
+        clean = manager.validate_settings(name, values)
+        if self.settings is None or self.store is None:
+            raise ValueError("后台设置存储不可用，无法保存插件设置")
         over = self.settings.overrides()
-        over.setdefault("app", {})["plugins"] = names
+        over[f"plugin:{name}"] = clean
         await self.store.save_settings(over)
         self.settings.set_overrides(over)
-
-        if enabled:
-            await self._install_plugin(name)
-        else:
-            await self._uninstall_plugin(name)
-        return {"name": name, "enabled": enabled,
-                "loaded": name in self.app.get("plugin_map", {})}
-
-    async def _install_plugin(self, name: str) -> None:
-        plugin_map = self.app.setdefault("plugin_map", {})
-        if name in plugin_map:
-            return
-        module = importlib.import_module(f"ska.plugins.{name}")
-        plugin_map[name] = module.install(self.app["bus"], self.app["cfg"])
-        logger.info("插件已装载：%s", name)
-
-    async def _uninstall_plugin(self, name: str) -> None:
-        instance = self.app.get("plugin_map", {}).pop(name, None)
-        if instance is None:
-            return
-        stopper = getattr(instance, "stop", None)
-        if stopper:
-            try:
-                result = stopper()
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:  # noqa: BLE001
-                logger.exception("插件卸载异常：%s", name)
-        logger.info("插件已卸载：%s", name)
+        if name in manager.loaded():          # 运行中就重载，让新设置立刻生效
+            await manager.reload(name)
+        return await self.plugin_settings(name)
 
     # ================================================================== 工具 / 智能体
     async def list_tools(self) -> list[dict[str, Any]]:
@@ -309,6 +359,152 @@ class AdminService:
 
     async def memory_message_delete(self, msg_id: int) -> bool:
         return await self.memory.delete_message(msg_id)
+
+    # 核心记忆（core_facts）：后台需要看到「Agent 始终记得的事」，
+    # 否则会出现「它说记住了，但记忆管理里找不到」的对不上号问题。
+    async def memory_core(self, limit: int = 100, user: str = "") -> list[dict[str, Any]]:
+        return await self.memory.list_core_entries(user=user, limit=limit)
+
+    async def memory_core_add(self, content: str, importance: float = 0.8,
+                              user: str = "") -> dict[str, Any]:
+        core_id = await self.memory.pin_core(content, user=user,
+                                             importance=float(importance))
+        return {"id": core_id}
+
+    async def memory_core_delete(self, core_id: int) -> bool:
+        return await self.memory.delete_core(core_id)
+
+    # 结构化事实（entity_facts）：摘要反思抽出的三元组，后台按槽位展示。
+    async def memory_facts(self, limit: int = 200, user: str = "") -> list[dict[str, Any]]:
+        return await self.memory.list_facts(user=user, limit=limit)
+
+    async def memory_fact_delete(self, fact_id: int) -> bool:
+        return await self.memory.delete_fact(fact_id)
+
+    # ---- 结构化事实导入（把某个领域的细分知识交给模型拆成原子事实）----
+    async def memory_facts_import(self, items: list[dict[str, Any]], *,
+                                  user: str = "") -> dict[str, int]:
+        """直接导入一组已写好的三元组；同槽位按 upsert 语义覆盖。"""
+        added = updated = skipped = 0
+        for item in items[:200]:              # 一次最多 200 条，防止误导入海量数据
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            subject = str(item.get("subject") or "").strip()
+            predicate = str(item.get("predicate") or "").strip()
+            obj = str(item.get("object") or "").strip()
+            if not (subject and predicate and obj):
+                skipped += 1
+                continue
+            try:
+                importance = float(item.get("importance", 0.6))
+            except (TypeError, ValueError):
+                importance = 0.6
+            state = await self.memory.upsert_fact(
+                subject, predicate, obj, user=user, importance=importance,
+                fact=str(item.get("fact") or ""))
+            if state == "added":
+                added += 1
+            else:
+                updated += 1
+        return {"added": added, "updated": updated, "skipped": skipped}
+
+    async def memory_facts_extract(self, text: str, *, user: str = "",
+                                   domain: str = "") -> dict[str, Any]:
+        """让模型把一段领域知识拆成结构化事实，再批量导入。
+
+        这是「导入某个领域细分知识」的入口：用户只需贴一段资料（或说明领域），
+        模型负责拆成 subject/predicate/object，后续检索/覆盖更新沿用既有机制。
+        """
+        body = str(text or "").strip()
+        if not body:
+            raise ValueError("知识原文不能为空")
+        gateway = self.app.get("gateway")
+        if gateway is None:
+            raise ValueError("LLM 网关未就绪")
+        prompt = f"领域：{domain.strip() or '通用'}\n知识原文：\n{body[:8000]}"
+        try:
+            data = await structured_chat(
+                gateway,
+                [ChatMessage(role="system", content=FACT_EXTRACT_SYSTEM),
+                 ChatMessage(role="user", content=prompt)],
+                task="fact_extract")
+        except (LLMError, StructuredError) as e:
+            raise ValueError(f"模型未能输出结构化事实：{e}") from e
+        items = data.get("facts") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items:
+            raise ValueError("模型没有拆出任何事实（可换种说法或补全知识原文）")
+        result = await self.memory_facts_import(items, user=user)
+        result["facts"] = [i for i in items if isinstance(i, dict)][:50]
+        return result
+
+    # ================================================================== 表情包管理
+    async def stickers(self, limit: int = 200) -> list[dict[str, Any]]:
+        book = self.app.get("stickers")
+        if book is None:
+            return []
+        return await book.list(limit=limit)
+
+    async def sticker_update(self, sticker_id: int, payload: dict[str, Any]) -> bool:
+        book = self.app.get("stickers")
+        if book is None:
+            raise ValueError("表情包库未启用")
+        return await book.update(
+            sticker_id,
+            description=payload.get("description"),
+            tags=payload.get("tags"),
+            emotion=payload.get("emotion"))
+
+    async def sticker_delete(self, sticker_id: int) -> bool:
+        book = self.app.get("stickers")
+        if book is None:
+            raise ValueError("表情包库未启用")
+        return await book.delete(sticker_id)
+
+    async def sticker_image(self, sticker_id: int) -> tuple[bytes, str] | None:
+        book = self.app.get("stickers")
+        if book is None:
+            return None
+        return await book.image(sticker_id)
+
+    async def stickers_import(self, items: list[dict[str, Any]], *,
+                              user: str = "") -> dict[str, int]:
+        """批量导入表情包：前端把文件夹里的每张图读成 base64 一起提交。
+
+        单张失败只记 failed，不影响整批；重复图片（sha256 命中）记为 skipped。
+        """
+        book = self.app.get("stickers")
+        if book is None:
+            raise ValueError("表情包库未启用")
+        added = skipped = failed = 0
+        for item in items[:200]:              # 单次请求上限，前端会分批提交
+            if not isinstance(item, dict):    # 前端传坏结构：计入失败，不影响整批
+                failed += 1
+                continue
+            name = str(item.get("name") or "")
+            raw = str(item.get("data") or "")
+            try:
+                blob = _decode_upload(raw)
+            except (binascii.Error, ValueError):
+                failed += 1
+                continue
+            if not blob:
+                failed += 1
+                continue
+            try:
+                result = await book.import_one(blob, name=name, user=user)
+            except Exception:  # noqa: BLE001 —— 单张异常不中断整批
+                logger.exception("导入表情包失败：%s", name)
+                failed += 1
+                continue
+            status = result.get("status")
+            if status == "added":
+                added += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+        return {"added": added, "skipped": skipped, "failed": failed}
 
     # ================================================================== 可发布目标
     async def list_targets(self) -> list[dict[str, Any]]:

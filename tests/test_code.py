@@ -13,7 +13,8 @@ import os
 import tempfile
 import unittest
 
-from ska.tools.base import ToolDeps
+from ska.tools.base import ToolDeps, decode_bytes, decode_output
+from ska.tools.builtin import _sniff_charset
 from ska.tools.code import CodeReadTool, CodeRunTool, CodeWriteTool
 
 
@@ -102,6 +103,58 @@ class TestCodeTools(unittest.IsolatedAsyncioTestCase):
         t = self._tool(CodeRunTool, {"enabled": True, "allow_dirs": [os.getcwd()],
                                      "sandbox": False})
         self.assertIsNone(t._check_command("rm -rf /"))
+
+
+class TestEncoding(unittest.TestCase):
+    """中文乱码回归：GBK 字节必须能被还原成正常中文。"""
+
+    def test_decode_gbk_bytes(self):
+        raw = "系统找不到指定的路径。".encode("gbk")
+        self.assertEqual(decode_bytes(raw), "系统找不到指定的路径。")
+
+    def test_decode_utf8_bytes(self):
+        raw = "系统找不到指定的路径。".encode("utf-8")
+        self.assertEqual(decode_bytes(raw), "系统找不到指定的路径。")
+
+    def test_decode_preferred_wins(self):
+        raw = "中文".encode("gbk")
+        self.assertEqual(decode_bytes(raw, preferred="gbk"), "中文")
+
+    def test_sniff_meta_charset_beats_header(self):
+        html = ('<html><head><meta charset="gbk"></head>').encode("ascii")
+        self.assertEqual(_sniff_charset(html, "text/html; charset=utf-8"), "gbk")
+
+    def test_sniff_header_fallback(self):
+        self.assertEqual(_sniff_charset(b"<html></html>", "text/html; charset=gb2312"),
+                         "gb2312")
+
+    def test_sniff_none(self):
+        self.assertEqual(_sniff_charset(b"<html></html>", "text/html"), "")
+
+    def test_sniff_ignores_unreliable_latin1(self):
+        """服务器把 UTF-8 页面标成 iso-8859-1 时不能被它带偏。"""
+        self.assertEqual(_sniff_charset(b"<html></html>",
+                                        "text/html; charset=iso-8859-1"), "")
+
+    def test_decode_mixed_lines(self):
+        """同一段输出里 GBK 行（cmd 提示）与 UTF-8 行（脚本输出）都要正确。"""
+        raw = ("系统找不到指定的路径。".encode("gbk") + b"\r\n"
+               + "脚本输出的中文".encode("utf-8") + b"\r\n")
+        self.assertEqual(decode_output(raw), "系统找不到指定的路径。\r\n脚本输出的中文\r\n")
+
+
+class TestCodeRunChineseOutput(unittest.IsolatedAsyncioTestCase):
+    """code_run 必须能正确还原子进程吐出的 GBK 中文（用户报告的乱码场景）。"""
+
+    async def test_gbk_output_is_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = CodeRunTool(ToolDeps(cfg=_StubCfg(
+                {"code": {"enabled": True, "allow_dirs": [tmp], "timeout": 10}})))
+            command = ('python -c "import sys;'
+                       "sys.stdout.buffer.write('系统找不到指定的路径'.encode('gbk'))\"")
+            out = await t.run(command=command)
+        self.assertIn("退出码 0", out)
+        self.assertIn("系统找不到指定的路径", out)
 
 
 if __name__ == "__main__":

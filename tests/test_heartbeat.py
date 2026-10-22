@@ -23,14 +23,18 @@ from ska.loop.sessions import SessionRegistry
 
 # =========================================================================== 桩
 class _Cfg:
-    """最小 Config 替身：只提供 beat 需要的 bpm 与 throttle 小节。"""
+    """最小 Config 替身：只提供 beat 需要的 bpm、throttle 与 dialog 小节。"""
 
-    def __init__(self) -> None:
+    def __init__(self, dialog: dict | None = None) -> None:
         self.throttle = {"active_hours": [0, 24], "proactive_max_per_min": 2,
                          "max_silent_beats": 10, "backoff_factor": 2, "send_fail_limit": 3}
+        self.dialog = dialog or {}
 
     def get(self, key: str, default: Any = None) -> Any:
         return {"bpm": 6}.get(key, default)
+
+    def section(self, name: str) -> dict:
+        return dict(self.dialog) if name == "dialog" else {}
 
 
 class _Channel:
@@ -155,6 +159,136 @@ class TestHeartbeatRouting(unittest.IsolatedAsyncioTestCase):
         beat._next_sleep = 0.0
         beat._note_sleep(MindResult(decision=Decision(action="silence")))
         self.assertEqual(beat._next_sleep, 0.0)          # 缺省 → 沿用默认心跳
+
+
+# =========================================================================== 对话窗口
+class TestDialogBatch(unittest.IsolatedAsyncioTestCase):
+    """推理期间堆积的同一聊天消息，必须合并成一批只回一次。"""
+
+    def _beat(self, dialog: dict | None = None):
+        mind = _Mind()
+        channels = {"cli": _Channel("cli")}
+        beat = BeatLoop(EventBus(), _Cfg(dialog), mind, SessionContext(20), channels,
+                        registry=SessionRegistry(20))
+        return beat, mind
+
+    @staticmethod
+    def _ev(text: str, *, user: str = "u1", name: str = "小明",
+            session: str = "", images: list | None = None) -> Event:
+        return Event(topic=TOPIC_INPUT, payload=CoreInput(
+            source="webchat_message", content=text, channel="webchat",
+            user=user, user_name=name, session=session, images=images or []))
+
+    async def test_same_chat_messages_are_merged(self):
+        beat, mind = self._beat()
+        await beat._on_events([self._ev("第一条"), self._ev("第二条"), self._ev("第三条")])
+
+        self.assertEqual(len(mind.woke), 1)                       # 只推理一次
+        self.assertEqual(mind.woke[0].content,
+                         "小明：第一条\n小明：第二条\n小明：第三条")
+        self.assertEqual(mind.woke[0].raw.get("_batch"), 3)       # 标记「这是一次性多句」
+
+    async def test_images_across_messages_are_collected(self):
+        """表情/图片也要并入同一批，否则「后面几张图」会被直接忽略。"""
+        beat, mind = self._beat()
+        await beat._on_events([
+            self._ev("看图", images=[{"kind": "image", "url": "http://x/1.png"}]),
+            self._ev("[表情包]", images=[{"kind": "sticker", "url": "http://x/2.gif"}]),
+        ])
+        self.assertEqual(len(mind.woke), 1)
+        self.assertEqual([i["kind"] for i in mind.woke[0].images], ["image", "sticker"])
+
+    async def test_group_chat_groups_by_group_not_sender(self):
+        """同一群里不同人说话属于同一窗口，必须合成一批（内容里标名字）。"""
+        beat, mind = self._beat()
+        a = Event(topic=TOPIC_INPUT, payload=CoreInput(
+            source="qq_message", content="在吗", user="1", user_name="小明",
+            channel="qq", message_type="group", group_id="99"))
+        b = Event(topic=TOPIC_INPUT, payload=CoreInput(
+            source="qq_message", content="在呢", user="2", user_name="小红",
+            channel="qq", message_type="group", group_id="99"))
+        await beat._on_events([a, b])
+
+        self.assertEqual(len(mind.woke), 1)
+        self.assertEqual(mind.woke[0].content, "小明：在吗\n小红：在呢")
+        self.assertEqual(mind.woke[0].group_id, "99")            # 回复仍投回该群
+
+    async def test_different_sessions_are_not_merged(self):
+        beat, mind = self._beat()
+        await beat._on_events([self._ev("A", session="s1"), self._ev("B", session="s2")])
+        self.assertEqual(len(mind.woke), 2)
+
+    async def test_batch_keeps_latest_and_notes_dropped(self):
+        """刷屏时只保留最近 N 条：永不追平旧账，但明确告知丢了多少。"""
+        beat, mind = self._beat({"batch_max_messages": 3})
+        await beat._on_events([self._ev(f"消息{i}") for i in range(5)])
+
+        self.assertEqual(len(mind.woke), 1)
+        content = mind.woke[0].content
+        self.assertTrue(content.startswith("（更早还有 2 条消息未展开）"))
+        self.assertIn("消息4", content)
+        self.assertNotIn("消息1", content)
+
+    async def test_batch_can_be_disabled(self):
+        """关掉开关后回到旧行为：逐条唤醒。"""
+        beat, mind = self._beat({"batch_enabled": False})
+        await beat._on_events([self._ev("一"), self._ev("二")])
+        self.assertEqual(len(mind.woke), 2)
+
+
+# =========================================================================== 多目标扇出
+class TestTargetFanout(unittest.IsolatedAsyncioTestCase):
+    """scheduler 可在输入包 raw["_targets"] 里声明多个投递目标，心跳按目标各发一份。"""
+
+    def _out(self) -> CoreOutput:
+        return CoreOutput(content="到点了", channel="cli", user="owner", session="s1",
+                          images=["a.jpg"])
+
+    def test_event_targets_reads_raw(self):
+        trigger = CoreInput(source="heartbeat", content="x",
+                            raw={"_targets": [{"channel": "qq", "target_type": "group",
+                                               "target_id": "1"}, "bad"]})
+        self.assertEqual(BeatLoop._event_targets(trigger),
+                         [{"channel": "qq", "target_type": "group", "target_id": "1"}])
+        self.assertEqual(BeatLoop._event_targets(CoreInput(source="heartbeat")), [])
+
+    def test_fanout_builds_one_copy_per_target(self):
+        items = BeatLoop._fanout(self._out(), [
+            {"channel": "qq", "target_type": "group", "target_id": "123"},
+            {"channel": "qq", "target_type": "user", "target_id": "456"},
+            {"channel": "webchat", "target_type": "user", "target_id": "owner"},
+        ])
+        self.assertEqual(len(items), 3)
+        self.assertEqual((items[0].target, items[0].group_id, items[0].user),
+                         ("group_msg", "123", ""))
+        self.assertEqual((items[1].target, items[1].user), ("private_msg", "456"))
+        # 非 QQ 渠道即便选的是群，也按私聊投递（该渠道没有群概念）
+        self.assertEqual((items[2].channel, items[2].target, items[2].user),
+                         ("webchat", "private_msg", "owner"))
+        self.assertEqual(items[0].content, "到点了")
+        self.assertEqual(items[0].images, ["a.jpg"])
+
+    def test_fanout_dedup_and_fallback(self):
+        out = self._out()
+        target = {"channel": "qq", "target_type": "group", "target_id": "123"}
+        self.assertEqual(len(BeatLoop._fanout(out, [target, dict(target)])), 1)
+        self.assertIs(BeatLoop._fanout(out, [])[0], out)      # 无目标 → 原样返回
+        self.assertIs(BeatLoop._fanout(out, [{"channel": "", "target_id": "x"}])[0], out)
+
+    async def test_deliver_sends_to_every_target(self):
+        channels = {"cli": _Channel("cli"), "qq": _Channel("qq"),
+                    "webchat": _Channel("webchat")}
+        beat = _make_beat(channels)
+        result = MindResult(decision=Decision(action="speak"), output=self._out())
+        await beat._deliver(result, proactive=False, targets=[
+            {"channel": "qq", "target_type": "group", "target_id": "123"},
+            {"channel": "webchat", "target_type": "user", "target_id": "owner"},
+        ])
+        self.assertEqual(len(channels["qq"].sent), 1)
+        self.assertEqual(channels["qq"].sent[0].group_id, "123")
+        self.assertEqual(len(channels["webchat"].sent), 1)
+        self.assertEqual(channels["webchat"].sent[0].user, "owner")
+        self.assertEqual(channels["cli"].sent, [])           # 来路的 cli 不再重复发
 
 
 if __name__ == "__main__":

@@ -224,3 +224,36 @@ pre.out {
 .ml-chip.err { background: #fdecec; color: var(--danger); }
 .ml-chip .ml-tk { color: var(--muted); font-size: 11px; }
 #ml-detail pre.out { margin-top: 8px; }
+
+/* ------------------------------------------------------------------ 表情包管理页 */
+/* 自适应卡片网格：窄屏少列、宽屏多列，不依赖任何前端框架 */
+.sk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+}
+.sk-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* 缩略图区域固定高度 + contain：保证不同尺寸的图不会把卡片撑变形 */
+.sk-card img {
+  width: 100%;
+  height: 118px;
+  object-fit: contain;
+  background: #fafbfd;
+  border-radius: 6px;
+}
+/* 卡片内的字段标签比全局 label 更紧凑 */
+.sk-card .sk-fields { display: flex; flex-direction: column; gap: 4px; }
+.sk-card .sk-fields label { margin: 0; font-size: 11px; }
+.sk-card .sk-fields input { padding: 4px 6px; font-size: 12px; }
+.sk-card .inline { justify-content: space-between; margin-top: 2px; }
+/* 记忆页的「导入领域知识」面板：三个输入框竖排，避免和表格挤在一起 */
+.fact-import { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.fact-import textarea { min-height: 90px; }

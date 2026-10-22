@@ -19,11 +19,12 @@ from ..admin.trace import emit_trace
 from ..kernel.packet import AgentResult, AgentStep, ToolCall
 from ..llm.gateway import LLMError
 from ..llm.models import ChatMessage
+from ..media.images import extract_image_markers   # 从工具结果里摘出 [[IMAGE:...]] 标记
 from ..tools.base import Tool, tool_schemas
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 5
+MAX_STEPS = 100
 
 # 工具结果截断上限（字符）：本地模型上下文有限，且工具可能吐回超长文本，
 # 不截断会把上下文撑爆（方案 §3.2 第 5 层「工具结果按需截断」）。
@@ -81,6 +82,9 @@ class AgentLoop:
         # 只在「允许集合」内声明工具；空集会让 tools 参数为 None，模型便不再要工具
         schemas = tool_schemas(self.tools, allow) or None
         steps: list[AgentStep] = []
+        # 本工具链收集到的图片（image_send 通过 [[IMAGE:...]] 标记附加），
+        # 最终随 AgentResult 交给 Mind 并入 CoreOutput.images。
+        images: list[str] = []
         step_no = 0
         trace_kw = {"trace_id": trace_id, "session": session, "sandbox": sandbox}
         last_sig: str | None = None      # 上一次工具调用的「签名」（名字 + 参数），用于查重
@@ -89,7 +93,7 @@ class AgentLoop:
         # 若决策已点名工具，先执行它（记为第 1 步，不额外消耗一次 LLM 调用）
         if first is not None:
             step_no = 1
-            obs = await self._exec(first, allow, **trace_kw)
+            obs = await self._exec(first, allow, images=images, **trace_kw)
             steps.append(AgentStep(step=1, thought="（按决策直接调用工具）",
                                    tool=first.name, args=first.args, observation=obs))
             convo.append(self._observation_msg(first.name, obs))
@@ -101,7 +105,7 @@ class AgentLoop:
                 resp = await self.gateway.chat(convo, tools=schemas, task="agent")
             except LLMError as e:
                 logger.warning("AgentLoop LLM 调用失败：%s", e)
-                return AgentResult(final="", steps=steps, error=str(e))
+                return AgentResult(final="", steps=steps, images=images, error=str(e))
 
             if resp.tool_call is not None:
                 sig = self._signature(resp.tool_call)
@@ -109,15 +113,20 @@ class AgentLoop:
                 last_sig = sig
                 if repeats >= MAX_REPEATS:
                     # 连续重复同一调用：多半是模型卡住了，提前止损（比耗尽 max_steps 更好）
-                    logger.info("AgentLoop 检测到重复调用 %s，提前终止", resp.tool_call.name)
+                    name = resp.tool_call.name
+                    logger.info("AgentLoop 检测到重复调用 %s，提前终止", name)
                     await emit_trace(self.bus, lane="act", kind="error",
-                                     title=f"重复调用被终止：{resp.tool_call.name}",
+                                     title=f"重复调用被终止：{name}",
                                      detail=f"参数：{resp.tool_call.args}", **trace_kw)
                     steps.append(AgentStep(step=step_no, thought=resp.content,
-                                           tool=resp.tool_call.name, args=resp.tool_call.args,
+                                           tool=name, args=resp.tool_call.args,
                                            observation="（检测到重复调用，已终止）"))
-                    return AgentResult(final="", steps=steps, stopped=True)
-                obs = await self._exec(resp.tool_call, allow, **trace_kw)
+                    # 截断必须有反馈：给模型一次「不再用工具」的收尾机会，
+                    # 拿不到就返回明确的提示文本（否则上层只会看到空回复）。
+                    return await self._finish_truncated(
+                        convo, steps, images, reason="repeat",
+                        notice=f"检测到连续重复调用 {name}，已提前终止")
+                obs = await self._exec(resp.tool_call, allow, images=images, **trace_kw)
                 steps.append(AgentStep(step=step_no, thought=resp.content,
                                        tool=resp.tool_call.name, args=resp.tool_call.args,
                                        observation=obs))
@@ -127,14 +136,51 @@ class AgentLoop:
 
             # 模型不再要求调工具 → 视为最终回答
             steps.append(AgentStep(step=step_no, thought=resp.content))
-            return AgentResult(final=(resp.content or "").strip(), steps=steps)
+            return AgentResult(final=(resp.content or "").strip(), steps=steps,
+                               images=images)
 
         # 步数用尽
         logger.info("AgentLoop 达到最大步数 %d，截断", self.max_steps)
-        return AgentResult(final="", steps=steps, stopped=True)
+        return await self._finish_truncated(
+            convo, steps, images, reason="max_steps",
+            notice=f"已达到最大步数 {self.max_steps}")
+
+    # ------------------------------------------------------------------ 截断收尾
+    async def _finish_truncated(self, convo: list[ChatMessage], steps: list[AgentStep],
+                                images: list[str], *, reason: str,
+                                notice: str) -> AgentResult:
+        """步数用尽/死循环时的收尾：把「被截断」这件事反馈给模型与上层。
+
+        为什么不能直接返回 final=""：
+            Mind 看到空 final 只会当作「这轮没话说」，用户也收不到任何说明——
+            表现就是「Agent 莫名其妙不吭声」。这里的做法是：
+            ① 追加一条系统消息，明确告知「本轮工具额度已用完，不能再调工具」；
+            ② 不带 tools 再调一次模型，让它用已有观察结果收尾（这一次它物理上调不了工具）；
+            ③ 模型仍想要工具 / 调用失败 / 返回空 → 用一句可读的兜底提示作为 final。
+        """
+        convo = list(convo)
+        convo.append(ChatMessage(role="system", content=(
+            f"【系统】本轮工具调用已结束（{notice}），你不能再调用任何工具。"
+            "请基于上面已经获得的信息，直接给出最终回答；"
+            "如果信息确实不足，就说明还缺什么，不要编造。")))
+        final = ""
+        try:
+            resp = await self.gateway.chat(convo, task="agent")   # 不传 tools：禁止再调
+            if resp.tool_call is None:                            # 仍在要工具 → 忽略
+                final = (resp.content or "").strip()
+        except LLMError as e:
+            logger.warning("AgentLoop 截断后的收尾调用失败：%s", e)
+
+        if not final:
+            final = (f"（工具调用已被截断：{notice}。"
+                     "如需继续，请把任务拆小一些，或在「智能体权限」里调大最大步数。）")
+        # 即使被截断，已收集到的图片也照样交回上层（图都画好了，不发就浪费了）
+        return AgentResult(final=final, steps=steps, images=images,
+                           stopped=True, stop_reason=reason)
 
     # ------------------------------------------------------------------ 内部
     async def _exec(self, call: ToolCall, allow: set[str] | None = None, *,
+                    images: list[str] | None = None,
                     trace_id: str = "", session: str = "", sandbox: bool = False) -> str:
         """执行一次工具调用，把任何异常都转成可读文本（不让单个工具崩掉整轮）。
 
@@ -168,6 +214,13 @@ class AgentLoop:
                              detail=str(e), sandbox=sandbox)
             return obs
         obs = str(result)
+        # image_send 把图片路径写成 [[IMAGE:...]] 标记返回：这里摘出来收进本次执行结果，
+        # 并从观察文本里删掉——模型不需要知道内部标记，也避免它复述标记污染回复。
+        obs, found = extract_image_markers(obs)
+        if found and images is not None:
+            images.extend(found)
+        if not obs and found:
+            obs = f"（已附加 {len(found)} 张图片，文字说明请用最终回答给出）"
         elapsed = time.time() - started
         truncated, _ = self._clip(obs)
         await emit_trace(self.bus, trace_id=trace_id, session=session, lane="act",

@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 # 让 heartbeat 层不依赖 loop 层；24 小时作为兜底，防止把心跳彻底停死）。
 MAX_SLEEP_SECONDS = 86400.0
 
+# 会被「对话窗口」合并的消息来源（用户真人消息；心跳/系统事件不合并）
+USER_SOURCES = frozenset({"cli_message", "qq_message", "webchat_message"})
+
 
 class BeatLoop:
     """心跳循环：装配好之后调用 run() 进入主循环。"""
@@ -81,6 +84,10 @@ class BeatLoop:
 
         # 三重闸参数（先用 config.yaml 的初值；启用后台后由 _refresh 热读覆盖层）
         self._load_from(cfg)
+        # 对话窗口（消息批处理）参数：默认开启，一批最多 12 条
+        self.batch_enabled = True
+        self.batch_max = 12
+        self._load_dialog(cfg)
         self._refresh()
 
         # 运行时状态
@@ -101,6 +108,18 @@ class BeatLoop:
         self.backoff_factor = max(int(th.get("backoff_factor", 2)), 1)
         self.send_fail_limit = int(th.get("send_fail_limit", 3))
 
+    def _load_dialog(self, cfg: Any) -> None:
+        """从 config.yaml 的 dialog 小节载入对话窗口参数（缺 section 的替身也不报错）。"""
+        try:
+            sec = cfg.section("dialog")
+        except AttributeError:                 # 测试替身只有 get/throttle
+            sec = {}
+        self.batch_enabled = bool(sec.get("batch_enabled", self.batch_enabled))
+        try:
+            self.batch_max = max(int(sec.get("batch_max_messages", self.batch_max) or 0), 1)
+        except (TypeError, ValueError):
+            pass
+
     def _refresh(self) -> None:
         """每拍重读「后台覆盖层」，让改 bpm/三重闸无需重启进程（settings 为 None 时无操作）。"""
         if self.settings is None:
@@ -113,6 +132,8 @@ class BeatLoop:
             self.max_silent = int(th.get("max_silent_beats", self.max_silent))
             self.backoff_factor = max(int(th.get("backoff_factor", self.backoff_factor)), 1)
             self.send_fail_limit = int(th.get("send_fail_limit", self.send_fail_limit))
+            # 对话窗口同样支持后台热改（改完立即按新上限合批）
+            self._load_dialog(self.settings)
         except (TypeError, ValueError):
             logger.warning("心跳参数热读失败，沿用旧值", exc_info=True)
 
@@ -197,7 +218,16 @@ class BeatLoop:
             logger.info("Agent 自主休眠 %.0fs（覆盖心跳；期间事件可立即唤醒）", self._next_sleep)
 
     async def _on_events(self, events: list[Event]) -> None:
-        """处理一批输入事件（drain 出来的）。"""
+        """处理一批输入事件（drain 出来的）。
+
+        对话窗口机制（本阶段新增）：
+            模型推理一条消息往往要好几秒，这期间同一个聊天里可能又来了好几条。
+            旧实现逐条 wake → 逐条回复，于是在高频群里永远在「补一句旧话」。
+            现在改为：先把这批事件按「聊天」分组，同一聊天的多条消息（含图片/表情）
+            合并成一个 CoreInput，只推理、只回复一次；多出来的文字按行拼接，
+            图片则并进 images 列表一起交给视觉分批解析（Mind 内部有数量上限）。
+        """
+        inputs: list[Any] = []
         for ev in events:
             if ev.topic == TOPIC_SYSTEM:
                 payload = ev.payload
@@ -210,15 +240,92 @@ class BeatLoop:
                 continue
             if not ev.is_input():
                 continue
+            inputs.append(ev.payload)
+
+        for trigger in self._batch_inputs(inputs):
             # 单个事件处理失败不能拖垮整个心跳循环（日志留痕后继续）
             try:
-                self._remember_route(ev.payload)      # 先记下来路，供主动发言回到正确会话
-                result = await self.mind.wake(self._ctx_for(ev.payload), ev.payload)
+                self._remember_route(trigger)        # 先记下来路，供主动发言回到正确会话
+                result = await self.mind.wake(self._ctx_for(trigger), trigger)
             except Exception:  # noqa: BLE001
-                logger.exception("处理事件失败，已跳过：topic=%s", ev.topic)
+                logger.exception("处理事件失败，已跳过：source=%s",
+                                 getattr(trigger, "source", ""))
                 continue
             self._note_sleep(result)                  # Agent 可能要求自主休眠
-            await self._deliver(result, proactive=False)
+            # scheduler 等插件可在 raw["_targets"] 里附带投递目标（可多个）
+            await self._deliver(result, proactive=False,
+                                targets=self._event_targets(trigger))
+
+    # ------------------------------------------------------------------ 对话窗口（批处理）
+    def _batch_inputs(self, payloads: list[Any]) -> list[Any]:
+        """把「同一聊天窗口里堆积的多条消息」合并成一批，其余原样通过。
+
+        分组键：
+            * 群聊 → group:<渠道>:<群号>（同一群不同人说话也属于同一窗口）；
+            * 私聊 / webchat → 会话键（渠道+用户+会话），与 SessionRegistry 一致。
+        非用户消息（心跳、系统事件）不参与合并，各自独立成一次唤醒。
+        """
+        if not self.batch_enabled or len(payloads) <= 1:
+            return payloads
+
+        groups: dict[str, list[Any]] = {}
+        order: list[str] = []
+        for payload in payloads:
+            key = self._chat_key(payload)
+            if not key:                              # 非用户消息：独立处理
+                groups[f"\0{id(payload)}"] = [payload]
+                order.append(f"\0{id(payload)}")
+                continue
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(payload)
+        return [self._merge_batch(groups[k]) for k in order]
+
+    def _chat_key(self, payload: Any) -> str:
+        """算出一条用户消息所属的「聊天窗口」；非用户消息返回空串。"""
+        source = str(getattr(payload, "source", "") or "")
+        if source not in USER_SOURCES:
+            return ""
+        channel = str(getattr(payload, "channel", "") or "")
+        if str(getattr(payload, "message_type", "") or "") == "group":
+            return f"group:{channel}:{getattr(payload, 'group_id', '')}"
+        if self.registry is not None:
+            return self.registry.key_for(payload)
+        return (f"{channel}:{getattr(payload, 'user', '')}:"
+                f"{getattr(payload, 'session', '')}")
+
+    def _merge_batch(self, payloads: list[Any]) -> Any:
+        """把同一窗口的多条消息压成一条 CoreInput（最后一条的来路作为回复目标）。"""
+        if len(payloads) == 1:
+            return payloads[0]
+        last = payloads[-1]
+        # 高频刷屏时永远追不上：只保留最近 N 条，更早的压成一句提示（而不是无限补课）
+        kept = payloads[-self.batch_max:]
+        dropped = len(payloads) - len(kept)
+        lines: list[str] = []
+        images: list[dict[str, Any]] = []
+        for payload in kept:
+            name = str(getattr(payload, "user_name", "") or getattr(payload, "user", "") or "")
+            text = str(getattr(payload, "content", "") or "").strip()
+            lines.append(f"{name}：{text}" if name else text)   # 标明是谁说的，群聊不乱
+            images.extend(list(getattr(payload, "images", None) or []))
+        content = "\n".join(lines)
+        if dropped:
+            content = f"（更早还有 {dropped} 条消息未展开）\n{content}"
+        logger.info("对话窗口合并：%d 条消息 → 1 批（渠道=%s，用户=%s）",
+                    len(payloads), getattr(last, "channel", ""),
+                    getattr(last, "user", ""))
+        # 用最后一条的来路（渠道/会话/群）作为回复目标，其余字段保留触发源语义；
+        # raw 里记一个 _batch 标记，供 Mind 生成提示词时知道这是「一次性多句」。
+        raw = dict(getattr(last, "raw", None) or {})
+        raw["_batch"] = len(payloads)
+        try:
+            return last.model_copy(update={"content": content, "images": images, "raw": raw})
+        except AttributeError:                       # 测试替身没有 model_copy
+            payload = dict(last) if isinstance(last, dict) else {}
+            payload.update({"content": content, "images": images, "raw": raw})
+            return payload
 
     async def _on_channel_status(self, ev: Event) -> None:
         """渠道断线/重连。
@@ -331,34 +438,85 @@ class BeatLoop:
         return len(self._proactive_ts) < self.max_per_min
 
     # ------------------------------------------------------------------ 交付
-    async def _deliver(self, result: MindResult, *, proactive: bool) -> None:
-        """把 Mind 的输出交给渠道发送（先过 output 事件，让 filter 等插件净化）。"""
+    @staticmethod
+    def _event_targets(payload: Any) -> list[dict[str, Any]]:
+        """读取插件在输入包 raw["_targets"] 里声明的投递目标（没有则为空）。
+
+        约定：目标项形如 {"channel": "qq", "target_type": "group", "target_id": "123"}；
+        scheduler 用于「日程触发后发到多个通道」，其余来源不会设置它。
+        """
+        raw = getattr(payload, "raw", None) or {}
+        if not isinstance(raw, dict):
+            return []
+        targets = raw.get("_targets")
+        if not isinstance(targets, list):
+            return []
+        return [t for t in targets if isinstance(t, dict)]
+
+    @staticmethod
+    def _fanout(out: Any, targets: list[dict[str, Any]] | None) -> list[Any]:
+        """把一份输出复制成「每个目标一份」；没有目标就原样返回。"""
+        items: list[Any] = []
+        seen: set[tuple[str, str, str]] = set()
+        for target in targets or []:
+            channel = str(target.get("channel") or "").strip()
+            target_type = str(target.get("target_type") or "group").strip()
+            target_id = str(target.get("target_id") or "").strip()
+            if not channel or not target_id:
+                continue
+            key = (channel, target_type, target_id)
+            if key in seen:                   # 重复目标只发一次
+                continue
+            seen.add(key)
+            is_group = target_type == "group"
+            items.append(out.model_copy(update={
+                "channel": channel,
+                # group_msg 只有 QQ 渠道支持；其它渠道按私聊投递
+                "target": "group_msg" if (is_group and channel == "qq") else "private_msg",
+                "group_id": target_id if is_group else "",
+                "user": "" if is_group else target_id,
+            }))
+        return items or [out]
+
+    async def _deliver(self, result: MindResult, *, proactive: bool,
+                       targets: list[dict[str, Any]] | None = None) -> None:
+        """把 Mind 的输出交给渠道发送（先过 output 事件，让 filter 等插件净化）。
+
+        targets 非空时按目标列表扇出（同一句话发到多个群/好友）；
+        每条目标都会各自过一遍可发布白名单校验。
+        """
         out = result.output
         if out is None or not out.is_visible():
             return
 
-        # 主动发言二次校验白名单（D7）：即便 Mind 产出了输出，也不越白名单乱发
-        if proactive and self.policy is not None:
-            target_type = "group" if out.target == "group_msg" else "user"
-            target_id = out.group_id if out.target == "group_msg" else out.user
-            if not await self.policy.can_publish(out.channel, target_type, target_id):
-                logger.info("目标 %s/%s 不在可发布白名单内，跳过本次主动发送",
-                            target_type, target_id)
-                return
+        attempted = False
+        sent_any = False
+        for item in self._fanout(out, targets):
+            # 主动发言二次校验白名单（D7）：即便 Mind 产出了输出，也不越白名单乱发
+            if proactive and self.policy is not None:
+                target_type = "group" if item.target == "group_msg" else "user"
+                target_id = item.group_id if item.target == "group_msg" else item.user
+                if not await self.policy.can_publish(item.channel, target_type, target_id):
+                    logger.info("目标 %s/%s 不在可发布白名单内，跳过本次主动发送",
+                                target_type, target_id)
+                    continue
 
-        # 信号类事件：只通知订阅者（filter 会在此原地清洗 content）
-        await self.bus.emit(TOPIC_OUTPUT, out)
+            # 信号类事件：只通知订阅者（filter 会在此原地清洗 content）
+            await self.bus.emit(TOPIC_OUTPUT, item)
 
-        channel = self.channels.get(out.channel) or self.channels.get(self._primary)
-        if channel is None:
-            logger.warning("没有可用渠道，丢弃输出")
-            return
-        ok = await channel.send(out)
-        if ok:
+            channel = self.channels.get(item.channel) or self.channels.get(self._primary)
+            if channel is None:
+                logger.warning("没有可用渠道，丢弃输出（%s）", item.channel)
+                continue
+            attempted = True
+            if await channel.send(item):
+                sent_any = True
+
+        if sent_any:
             self._send_fails = 0
             if proactive:
                 self._proactive_ts.append(time.time())
-        else:
+        elif attempted:
             self._send_fails += 1
             if self._send_fails >= self.send_fail_limit:
                 self._circuit_open = True

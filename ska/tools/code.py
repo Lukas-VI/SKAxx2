@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ..kernel.config import package_root
-from .base import Tool, tool
+from .base import Tool, decode_bytes, decode_output, tool
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,11 @@ class _CodeToolBase(Tool):
             extra = [extra]
         allow.update(str(k) for k in extra)
         env = {k: v for k, v in os.environ.items() if k in allow}
-        env.setdefault("PYTHONIOENCODING", "utf-8")   # 保证子进程输出编码可控
+        # 两个变量一起设：PYTHONIOENCODING 管 stdout/stderr 编码，
+        # PYTHONUTF8 让子进程的 open()/文件编码也走 UTF-8（Python 3.7+ 的 UTF-8 模式）。
+        # 缺了后者，子进程「读中文文件」仍会按 GBK 打开，输出照样乱。
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
         return env
 
     def _check_command(self, command: str) -> str | None:
@@ -215,7 +219,9 @@ class CodeReadTool(_CodeToolBase):
         if not target.is_file():
             return f"不是文件或不存在：{target}"
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            # 不假定文件一定是 UTF-8：Windows 记事本存的中文常是 GBK，
+            # 直接 utf-8 读会得到一串替换符（表现为「文件里的中文全变问号/方块」）。
+            text = decode_bytes(target.read_bytes())
         except OSError as e:
             return f"读取失败：{e}"
         lines = text.splitlines()
@@ -292,7 +298,7 @@ class CodeRunTool(_CodeToolBase):
                 return err
         try:
             proc = await asyncio.create_subprocess_shell(
-                command, cwd=str(work), env=self._safe_env(),   # 沙盒：清洗环境变量
+                command, cwd=str(work), env=self._safe_env(),  # 沙盒：清洗环境变量
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         except OSError as e:
             return f"命令启动失败：{e}"
@@ -301,5 +307,7 @@ class CodeRunTool(_CodeToolBase):
         except asyncio.TimeoutError:
             proc.kill()                          # 超时即杀，避免僵尸进程
             return f"命令超时（>{self._timeout():.0f}s）：{command}"
-        text = (out or b"").decode("utf-8", errors="replace")
+        # 逐行解码：cmd 自身的提示是 GBK，脚本输出多是 UTF-8，混在一起时
+        # 整段解码必然有一半乱码；decode_output 按行各自挑编码，两边都能读。
+        text = decode_output(out or b"")
         return f"退出码 {proc.returncode}\n{self._clip(text)}"

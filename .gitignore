@@ -32,3 +32,4 @@ config/persona.yaml
 # ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+ska/plugins/%SystemDrive%/ProgramData/Microsoft/Windows/Caches/

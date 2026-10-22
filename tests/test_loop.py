@@ -106,12 +106,20 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.steps), 1)
 
     async def test_max_steps_truncation(self):
-        """模型不停要工具 → 步数用尽被截断，不会无限循环。"""
-        llm = FakeLLM([("继续查", ToolCall(name="time", args={})), ])
-        loop = AgentLoop(llm, self._tools(), "你是助手", max_steps=3)
+        """模型不停要工具 → 步数用尽被截断，且必须给出可读反馈（不能是空回复）。"""
+        # 每次调用的参数都不同，避免触发「重复调用」提前止损，精确走到 max_steps。
+        llm = FakeLLM([
+            ("继续查1", ToolCall(name="time", args={"n": 1})),
+            ("继续查2", ToolCall(name="time", args={"n": 2})),
+            ("继续查3", ToolCall(name="time", args={"n": 3})),
+        ])
+        loop = AgentLoop(llm, self._tools(), "你是助手", max_steps=2)
         result = await loop.run([ChatMessage(role="user", content="查吧")])
         self.assertTrue(result.stopped)
-        self.assertLessEqual(len(result.steps), 3)
+        self.assertEqual(result.stop_reason, "max_steps")
+        self.assertLessEqual(len(result.steps), 2)
+        # 收尾调用里模型仍在要工具 → 用可读兜底文案而不是空字符串
+        self.assertIn("截断", result.final)
 
     async def test_repeated_tool_call_terminated_early(self):
         """模型连续用同一参数调同一工具 → 提前止损（不必耗尽 max_steps）。"""
@@ -119,8 +127,27 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         loop = AgentLoop(llm, self._tools(), "你是助手", max_steps=5)
         result = await loop.run([ChatMessage(role="user", content="查吧")])
         self.assertTrue(result.stopped)
+        self.assertEqual(result.stop_reason, "repeat")
         self.assertEqual(len(result.steps), 3)      # 第 3 次重复时终止
         self.assertLess(len(result.steps), 5)
+        self.assertIn("重复调用", result.final)
+
+    async def test_truncation_gives_model_a_final_answer_chance(self):
+        """截断后追加系统提示、且这次不传 tools，模型可以基于已有观察收尾。"""
+        llm = FakeLLM([
+            ("先查一下", ToolCall(name="time", args={"n": 1})),
+            ("再查一下", ToolCall(name="time", args={"n": 2})),
+            ("根据已有信息，结论是中午十二点。", None),
+        ])
+        loop = AgentLoop(llm, self._tools(), "你是助手", max_steps=2)
+        result = await loop.run([ChatMessage(role="user", content="现在几点")])
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.stop_reason, "max_steps")
+        self.assertIn("结论", result.final)
+        # 收尾那一次调用的最后一条消息应是「不能再调工具」的系统提示
+        last_msg = llm.calls[-1][-1]
+        self.assertEqual(last_msg.role, "system")
+        self.assertIn("不能再调用任何工具", last_msg.content)
 
     async def test_tool_error_does_not_crash_loop(self):
         """工具抛异常 → 观察文本转成「工具执行失败」，循环继续。"""
@@ -150,10 +177,18 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
         return CoreInput(source="cli_message", content=text, user="u",
                          user_name="小明", channel="cli")
 
+    def test_describe_uses_batch_wording(self):
+        """对话窗口合并批：不能读成「小明说：小明：…」。"""
+        trigger = CoreInput(source="qq_message", content="小明：在吗\n小红：在呢",
+                            user="1", user_name="小明", channel="qq",
+                            message_type="group", group_id="9", raw={"_batch": 2})
+        text = Mind._describe(trigger)
+        self.assertIn("（群里）连续发来几条消息", text)
+        self.assertIn("小红：在呢", text)
+
     async def test_speak_decision(self):
         """决策 speak → MindResult 带可见输出，且工作记忆记录了对话。"""
         llm = FakeLLM([
-            ("他在跟我打招呼，心情不错。", None),          # 内独白
             ('{"action":"speak","content":"你好呀，小明！","importance":0.4,"reason":"礼貌回应"}', None),
         ])
         mind = self._mind(llm)
@@ -163,6 +198,8 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.decision.action, "speak")
         self.assertEqual(result.output.content, "你好呀，小明！")
         self.assertTrue(result.output.is_visible())
+        # 默认不再先跑独白：一次唤醒只要一次决策调用（响应更快）
+        self.assertEqual(len(llm.calls), 1)
         # 记忆落库 + 工作记忆
         self.assertIn("小明", ctx.to_chat()[-2]["content"])
         rows = await self.store.recent_messages(10, "u")
@@ -171,7 +208,6 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
     async def test_silence_decision(self):
         """决策 silence → 无输出。"""
         llm = FakeLLM([
-            ("他只是在测试我。", None),
             ('{"action":"silence","content":"","importance":0.1,"reason":"无需回应"}', None),
         ])
         result = await self._mind(llm).wake(SessionContext(20), self._input())
@@ -181,7 +217,6 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
     async def test_remember_decision_writes_long_memory(self):
         """决策 remember → 写入长期记忆，不回话。"""
         llm = FakeLLM([
-            ("他告诉我一件重要的事。", None),
             ('{"action":"remember","memory":"小明怕打针","importance":0.9,"reason":"重要事实"}', None),
         ])
         result = await self._mind(llm).wake(SessionContext(20), self._input())
@@ -193,7 +228,6 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
     async def test_tool_decision_runs_agent(self):
         """决策 tool → 交给 AgentLoop 执行，输出用执行结果。"""
         llm = FakeLLM([
-            ("他问时间，我需要工具。", None),
             ('{"action":"tool","tool":{"name":"fake_time","args":{}},"content":"","importance":0.3,"reason":"查时间"}', None),
             ("现在是中午十二点整。", None),
         ])
@@ -219,13 +253,40 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
     async def test_structured_failure_degrades_to_plain(self):
         """决策 JSON 解析失败 → 降级为纯文本直发（不回退到再推理死循环）。"""
         llm = FakeLLM([
-            ("他在问我在不在。", None),
-            ("这不是JSON", None),          # 结构化失败
+            ("这不是JSON", None),          # 首次决策 → 结构化失败
             ("我在的，有什么需要帮忙的？", None),   # 降级文本
         ])
         result = await self._mind(llm).wake(SessionContext(20), self._input())
         self.assertEqual(result.decision.action, "speak")
         self.assertIn("我在", result.output.content)
+
+    async def test_think_action_runs_monologue_then_decides(self):
+        """action=think：先做一次显式独白，再重新决策（只多这一次调用）。"""
+        llm = FakeLLM([
+            ('{"action":"think","content":"他为什么突然不说话了？","importance":0.4,"reason":"拿不准"}', None),
+            ("也许他只是累了，别急着追问。", None),          # 显式思考
+            ('{"action":"speak","content":"要不要先歇会儿？","importance":0.5,"reason":"关心"}', None),
+        ])
+        result = await self._mind(llm).wake(SessionContext(20), self._input("……"))
+
+        self.assertEqual(result.decision.action, "speak")
+        self.assertEqual(result.monologue, "也许他只是累了，别急着追问。")
+        self.assertEqual(result.output.content, "要不要先歇会儿？")
+        self.assertEqual(len(llm.calls), 3)             # 决策 → 独白 → 决策
+        self.assertIn("他为什么突然不说话了？", llm.calls[1][-1].content)   # 思考方向进了独白
+
+    async def test_think_twice_falls_back_to_silence(self):
+        """想完还在 think → 视为没有结论，沉默收场，绝不允许无限自省。"""
+        llm = FakeLLM([
+            ('{"action":"think","content":"再想想","importance":0.3,"reason":"复杂"}', None),
+            ("还是想不清楚。", None),
+            ('{"action":"think","content":"继续想","importance":0.3,"reason":"复杂"}', None),
+        ])
+        result = await self._mind(llm).wake(SessionContext(20), self._input("……"))
+
+        self.assertEqual(result.decision.action, "silence")
+        self.assertIsNone(result.output)
+        self.assertEqual(len(llm.calls), 3)             # 第二次 think 被截断，不进入第三轮
 
     async def test_memory_recall_included_in_decision_prompt(self):
         """有长期记忆时，决策提示词应包含召回内容（构建记忆块）。
@@ -234,12 +295,11 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
         """
         await self.store.add_long("我喜欢酒心巧克力，讨厌打针", importance=0.9, user="u")
         llm = FakeLLM([
-            ("想起他喜欢巧克力。", None),
             ('{"action":"speak","content":"对呀，我记得你喜欢酒心巧克力。","importance":0.5,"reason":"基于记忆"}', None),
         ])
         result = await self._mind(llm).wake(SessionContext(20), self._input("我之前说过我喜欢吃什么"))
-        # 决策用户消息应带上「你想起的旧事」
-        decision_call = llm.calls[1]
+        # 决策用户消息应带上「你想起的旧事」（默认不再有独白，决策就是第 1 次调用）
+        decision_call = llm.calls[0]
         user_text = decision_call[-1].content
         self.assertIn("酒心巧克力", user_text)
         self.assertIn("酒心巧克力", result.output.content)
@@ -263,14 +323,13 @@ class TestMind(unittest.IsolatedAsyncioTestCase):
                                      "parameters": {"type": "object", "properties": {}}}}
 
         llm = FakeLLM([
-            ("他在问我算数。", None),                 # 内独白
             ('{"action":"speak","content":"42","importance":0.3,"reason":"算数"}', None),
         ])
         loop = AgentLoop(llm, {"calc_x": CalcTool()}, "你是助手")
         mind = Mind(llm, loop, store=self.store, persona_prompt="你叫小赛。")
         await mind.wake(SessionContext(20), self._input("1+1等于几"))
 
-        decision_call = llm.calls[1]                  # calls[0]=独白，calls[1]=决策
+        decision_call = llm.calls[0]                  # 默认无独白，第 0 次就是决策
         user_text = decision_call[-1].content
         self.assertIn("calc_x", user_text)            # 工具名进提示词
         self.assertIn("算一算数学表达式", user_text)   # 工具说明也进提示词

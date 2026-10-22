@@ -52,6 +52,11 @@ class CoreInput(BaseModel):
     session: str = ""
     # 沙盒标记：persist=false 的在线会话置 True —— 照常推理，但不写任何记忆库。
     sandbox: bool = False
+    # ---- 图片 IO：随消息一起进来的图片/表情包段 ----
+    # 每项形如 {"kind": "image|sticker|face|mface", "url": "...", "file": "...",
+    #          "sub_type": "1", "summary": "..."}；由渠道解析 OneBot 消息段时填充。
+    # 文本里仍保留「[图片]」占位，视觉解析结果由 Mind 追加到正文（见 _describe 链路）。
+    images: list[dict[str, Any]] = Field(default_factory=list)
     ts: float = Field(default_factory=time.time)
     raw: dict[str, Any] = Field(default_factory=dict)  # 原始报文，便于排查
 
@@ -76,6 +81,9 @@ class CoreOutput(BaseModel):
     channel: str = "cli"                      # 走哪个渠道
     user: str = ""                            # 私聊对象
     group_id: str = ""                        # 群号
+    # 随消息一起发出的图片：本地绝对路径或 http(s) URL。
+    # QQ 渠道会把它转成 OneBot image 段（URL 原样传，本地文件转 base64://）。
+    images: list[str] = Field(default_factory=list)
     # 阶段三：输出来自哪个会话。webchat 渠道据此把回复投回对应的会话队列；
     # 旧渠道不传 → 空串，行为不变。
     session: str = ""
@@ -116,7 +124,12 @@ class AgentResult(BaseModel):
 
     final: str = ""                            # 最终可对外的文本
     steps: list[AgentStep] = Field(default_factory=list)
+    # 工具链里通过 image_send 附加的图片（本地路径/URL）；Mind 会并入 CoreOutput.images
+    images: list[str] = Field(default_factory=list)
     stopped: bool = False                      # 是否因达到 max_steps 被截断
+    # 截断原因（max_steps / repeat；空=正常结束）——上层据此给出可读反馈，
+    # 不再出现「被截断但没人知道」的静默失败。
+    stop_reason: str = ""
     error: str = ""                            # 执行期错误摘要（可为空）
 
 
@@ -145,10 +158,16 @@ class Route(BaseModel):
 class Decision(BaseModel):
     """Mind 的决策結果（决策者视角）。"""
 
-    action: Literal["speak", "silence", "remember", "tool"]
-    content: str = ""                          # action=speak 时要说的话
+    action: Literal["speak", "silence", "remember", "tool", "sticker", "think"]
+    content: str = ""                          # action=speak 时要说的话（sticker 时为配文/兜底）
     tool: ToolCall | None = None               # action=tool 时的调用意图
     memory: str = ""                           # action=remember 时写入的记忆文本
+    # ---- 图片/表情包（阶段四） ----
+    # sticker：表情包检索词（如「开心」「无语」）；本地库命中就直接发表情包，
+    #          没命中则退化为 speak（用 content 兜底）。
+    sticker: str = ""
+    # images：speak 时可附带本地路径或 URL（如代码画图后的 PNG）。
+    images: list[str] = Field(default_factory=list)
     importance: float = 0.5                    # 重要性 0~1（记忆排序用）
     reason: str = ""                           # 决策理由（只进日志/内独白）
     # ---- 阶段三增强：自主路由 + 自主休眠（见方案 §2） ----
@@ -188,6 +207,8 @@ TraceKind = Literal[
     "compress",      # 上下文压缩 / 记忆整理
     "memory_write",  # 写入长期记忆或画像
     "output",        # 最终输出投递给渠道
+    "image",         # 来图解析（视觉模型读图/表情包入库）
+    "sticker",       # 发表情包（本地库命中）
     "error",         # 异常
 ]
 

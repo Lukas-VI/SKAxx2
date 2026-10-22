@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .base import Tool, tool
+from .base import Tool, decode_bytes, tool
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,30 @@ class CalculatorTool(Tool):
 _TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
 _HTML_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\n{3,}")
+# 网页自述编码：<meta charset="gbk"> 与 <meta http-equiv=... content="...; charset=gbk">
+_META_CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.I)
+_HEADER_CHARSET_RE = re.compile(r"charset\s*=\s*([\w\-]+)", re.I)
+
+
+def _sniff_charset(raw: bytes, content_type: str = "") -> str:
+    """猜网页编码：优先页面内 <meta charset>，其次响应头 Content-Type，猜不到返回空串。
+
+    为什么 meta 优先：不少中文站点响应头只写 `text/html`（或错误的 iso-8859-1），
+    但页面里老老实实写了 `charset=gbk`——只信响应头会把整页中文解成乱码。
+    """
+    head = raw[:4096].lower()                      # 只看前 4KB，够定位 <head> 里的声明
+    match = _META_CHARSET_RE.search(head)
+    if match:
+        declared = match.group(1).decode("ascii", "ignore")
+    else:
+        header = _HEADER_CHARSET_RE.search(content_type or "")
+        declared = header.group(1) if header else ""
+    # 单字节的「服务器默认值」基本不可信：大量 UTF-8 页面被服务器硬标成
+    # iso-8859-1，按它解码虽然不报错，但中文会整页变乱码。这类声明直接丢弃，
+    # 交给 decode_bytes 的 UTF-8 → GB18030 自动探测。
+    if declared.lower() in ("iso-8859-1", "latin-1", "us-ascii", "ascii"):
+        return ""
+    return declared
 
 
 @tool("fetch")
@@ -131,7 +155,11 @@ class FetchTool(Tool):
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                 resp = await client.get(url, headers={"User-Agent": "SKAxx2/0.1"})
                 resp.raise_for_status()
-                html = resp.text
+                # 不用 resp.text：httpx 在响应头没写 charset 时默认 UTF-8，
+                # 抓 GBK 页面会整页乱码。这里先按 meta/响应头猜测，再交给 decode_bytes 兜底。
+                raw = resp.content
+                html = decode_bytes(raw, preferred=_sniff_charset(
+                    raw, resp.headers.get("content-type", "")))
         except httpx.HTTPError as e:
             return f"抓取失败：{e}"
 

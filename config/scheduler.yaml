@@ -17,13 +17,13 @@
 tasks:
   - name: "morning_greeting"
     at: "08:30"
-    payload: "早上了，看看要不要跟他说句早安。"
-    enabled: false        # 默认关闭，避免打扰；需要时改 true
+    payload: "早上了，打破群聊的寂静，跟群里的他们说句早安。使用fetch获取各成员所在地的天气预报、在网上找新闻热点汇集成早报，向大家汇报。"
+    enabled: true        # 默认关闭，避免打扰；需要时改 true
 
   - name: "night_check"
-    at: "22:30"
-    payload: "快到他平时睡觉的点了，关心一下。"
-    enabled: false
+    at: "00:15"
+    payload: "快到他们平时睡觉的点了，去群里关心一下。"
+    enabled: true
 
   - name: "self_reflection"
     cron: "0 3 * * *"     # 每天凌晨 3 点：让 Mind 做一次自发反思

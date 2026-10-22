@@ -140,7 +140,7 @@ class WebServer:
         logger.info("WebUI 已停止")
 
     # ------------------------------------------------------------------ 线程 ↔ 循环桥
-    def run_coro(self, coro, timeout: float = 60.0):
+    def run_coro(self, coro, timeout: float = 6000.0):
         """把协程提交到主事件循环执行并等待结果（HTTP 线程调用入口）。
 
         Args:

@@ -62,6 +62,12 @@ function table(headers, rows) {
 
 const LEVELS = ['blacklist', 'guest', 'member', 'admin', 'owner'];
 
+// 记忆库各表的中文名：状态页与记忆管理页统一叫法，避免「表名对不上号」
+const MEM_CN = {
+  core_facts: '核心记忆', long_memory: '长期记忆', entity_facts: '结构化事实',
+  profile: '用户画像', sessions: '会话摘要', messages: '原始流水',
+};
+
 // ===========================================================================
 // 2) 引导流程
 // ===========================================================================
@@ -221,7 +227,8 @@ const PAGES = [
           <div class="spacer"></div><div>渠道：${chans || '（无）'}</div>
         </div>
         <div class="panel"><h3>数据规模</h3>
-          <div>记忆库：${Object.entries(d.memory).map(([k, v]) => `${esc(k)}=${v}`).join(' · ') || '（未启用）'}</div>
+          <div>记忆库：${Object.entries(d.memory).map(([k, v]) =>
+            `${MEM_CN[k] || esc(k)}=${v}`).join(' · ') || '（未启用）'}</div>
           <div>管理库：${Object.entries(d.admin).map(([k, v]) => `${esc(k)}=${v}`).join(' · ')}</div>
         </div>`;
     },
@@ -247,9 +254,20 @@ const PAGES = [
               <input id="q-group" value="${esc(cfg.default_group)}"></div>
             <div><label>默认私聊对象 user_id</label>
               <input id="q-user" value="${esc(cfg.default_user)}"></div>
+            <div><label>SnowLuma 启动命令（自动启动用）</label>
+              <input id="q-cmd" value="${esc(cfg.snowluma_command || '')}"
+                placeholder="D:/SnowLuma/snowluma.exe"></div>
+            <div><label>启动工作目录（可留空）</label>
+              <input id="q-cwd" value="${esc(cfg.snowluma_cwd || '')}"></div>
+            <div><label>SnowLuma WebUI 端口（避免重复拉起，0=不检测）</label>
+              <input id="q-webui" type="number" value="${cfg.snowluma_webui_port || 0}"></div>
+            <div><label>等待就绪秒数</label>
+              <input id="q-start-timeout" type="number" value="${cfg.startup_timeout || 60}"></div>
           </div>
           <div class="checkbox"><input type="checkbox" id="q-enabled" ${cfg.enabled ? 'checked' : ''}>
             <label for="q-enabled" style="margin:0">启用 QQ 渠道</label></div>
+          <div class="checkbox"><input type="checkbox" id="q-auto" ${cfg.auto_start ? 'checked' : ''}>
+            <label for="q-auto" style="margin:0">启用 QQ 时自动启动 SnowLuma（已连通则跳过）</label></div>
           <p class="hint">当前状态：<span class="badge ${cfg.connected ? 'ok' : 'off'}">${cfg.connected ? '已连接' : '未连接'}</span>
             · 请把 <code>http://127.0.0.1:${(await api('GET', '/api/settings')).web.port}/onebot/events</code>
             填入 SnowLuma 的 <code>httpClients</code></p>
@@ -269,7 +287,12 @@ const PAGES = [
           report_token: c.querySelector('#q-report').value.trim(),
           default_group: c.querySelector('#q-group').value.trim(),
           default_user: c.querySelector('#q-user').value.trim(),
+          snowluma_command: c.querySelector('#q-cmd').value.trim(),
+          snowluma_cwd: c.querySelector('#q-cwd').value.trim(),
+          snowluma_webui_port: parseInt(c.querySelector('#q-webui').value, 10) || 0,
+          startup_timeout: parseInt(c.querySelector('#q-start-timeout').value, 10) || 60,
           enabled: c.querySelector('#q-enabled').checked,
+          auto_start: c.querySelector('#q-auto').checked,
           transport: 'http',
         };
         const token = c.querySelector('#q-token').value;
@@ -449,26 +472,76 @@ const PAGES = [
 
   // ---------------------------------------------------------------- 记忆管理
   {
-    id: 'memory', label: '记忆管理', desc: '长期记忆、会话摘要、用户画像与原始流水',
+    id: 'memory', label: '记忆管理',
+    desc: '核心记忆、长期记忆、结构化事实、用户画像、会话摘要与原始流水',
     async load(root, c) {
-      let tab = 'long';
+      // 页签与 MemoryStore 的真实分层一一对应，避免「Agent 记住了但页面上找不到」：
+      //   core     → core_facts    （Agent pin 的核心记忆，始终注入提示词）
+      //   long     → long_memory   （FTS5 可检索的原文记忆）
+      //   facts    → entity_facts  （摘要反思抽出的三元组，同槽位覆盖合并）
+      //   profile  → profile       （用户画像：昵称 + 事实列表）
+      //   sessions → sessions      （会话摘要）
+      //   messages → messages      （原始对话流水）
+      let tab = 'core';
       const draw = async () => {
         let body = '';
-        if (tab === 'long') {
+        if (tab === 'core') {
+          const d = await api('GET', '/api/memory/core?limit=100');
+          const rows = d.items.map((m) => [m.id, esc(m.content), m.importance,
+            esc(m.user || '（全局）'), fmtTime(m.created_ts),
+            `<button class="mini danger" data-del-core="${m.id}">删除</button>`]);
+          body = `
+            <div class="row"><div><label>新增核心记忆（之后始终记得）</label><input id="m-core-content"></div>
+              <div class="shrink" style="max-width:120px"><label>重要性</label><input id="m-core-imp" value="0.8"></div>
+              <div class="shrink"><label>&nbsp;</label><button id="m-core-add">添加</button></div></div>
+            <p class="hint">核心记忆不参与检索，每次决策都会注入；实际注入条数由「设置 → 记忆 → 核心记忆上限」控制。</p>
+            <div class="spacer"></div>
+            ${table(['ID', '内容', '重要性', '归属用户', '创建时间', '操作'], rows)}`;
+        } else if (tab === 'long') {
           const d = await api('GET', '/api/memory/long?limit=100');
           const rows = d.items.map((m) => [m.id, esc(m.content), m.importance,
-            esc(m.source), esc(m.user), fmtTime(m.created_ts),
+            esc(m.source), esc(m.user || '（全局）'), fmtTime(m.created_ts),
             `<button class="mini danger" data-del="${m.id}">删除</button>`]);
           body = `
             <div class="row"><div><label>新增记忆内容</label><input id="m-content"></div>
               <div class="shrink" style="max-width:120px"><label>重要性</label><input id="m-imp" value="0.5"></div>
               <div class="shrink"><label>&nbsp;</label><button id="m-add">添加</button></div></div>
+            <p class="hint">长期记忆是需要关键词检索才会被想起的原文（FTS5 三因子排序）。</p>
             <div class="spacer"></div>
             ${table(['ID', '内容', '重要性', '来源', '用户', '时间', '操作'], rows)}`;
+        } else if (tab === 'facts') {
+          const d = await api('GET', '/api/memory/facts?limit=200');
+          const rows = d.items.map((f) => [f.id, esc(f.fact),
+            esc(`${f.subject} · ${f.predicate} · ${f.object}`), f.importance,
+            esc(f.user || '（全局）'), fmtTime(f.last_seen), f.updated_count,
+            `<button class="mini danger" data-del-fact="${f.id}">删除</button>`]);
+          body = `
+            <p class="hint">结构化事实：同一「主体 · 关系」视为同一槽位，新值覆盖旧值并累加更新次数。</p>
+            <div class="spacer"></div>
+            ${table(['ID', '事实', '主体 · 关系 · 客体', '重要性', '归属用户', '最近更新', '更新次数', '操作'], rows)}
+            <div class="spacer"></div>
+            <h3>导入领域知识</h3>
+            <p class="hint">贴一段某领域的细分知识（设定、术语表、人物关系…），模型会拆成
+              主体/关系/客体并写入上表；同一槽位自动覆盖。也可直接粘贴已写好的 JSON 三元组。</p>
+            <div class="row">
+              <div><label>领域（可选，帮助模型理解语境）</label><input id="m-fact-domain" placeholder="例如：某游戏的角色设定"></div>
+              <div style="max-width:160px"><label>归属用户（可选）</label><input id="m-fact-user" placeholder="留空=全局"></div>
+            </div>
+            <div class="fact-import">
+              <textarea id="m-fact-text" placeholder="粘贴知识原文…"></textarea>
+              <div class="inline">
+                <button id="m-fact-extract">让模型拆分并导入</button>
+                <span class="hint" id="m-fact-status"></span>
+              </div>
+              <textarea id="m-fact-json" placeholder='或粘贴 JSON：[{"subject":"角色A","predicate":"属于","object":"阵营B","fact":"…","importance":0.7}]'></textarea>
+              <div class="inline">
+                <button id="m-fact-import" class="ghost">直接导入 JSON</button>
+              </div>
+            </div>`;
         } else if (tab === 'sessions') {
           const d = await api('GET', '/api/memory/sessions');
           body = table(['ID', '用户', '摘要', '开始', '结束', '操作'], d.items.map((s) => [
-            s.id, esc(s.user), esc(s.summary), fmtTime(s.started_ts), fmtTime(s.ended_ts),
+            s.id, esc(s.user || '（全局）'), esc(s.summary), fmtTime(s.started_ts), fmtTime(s.ended_ts),
             `<button class="mini danger" data-del-session="${s.id}">删除</button>`]));
         } else if (tab === 'profile') {
           const d = await api('GET', '/api/memory/profile');
@@ -476,14 +549,16 @@ const PAGES = [
             esc(p.user), esc(p.nick), esc((p.facts || []).join('；')), fmtTime(p.updated_ts)]));
         } else {
           const d = await api('GET', '/api/memory/messages?limit=150');
-          body = table(['ID', '角色', '用户', '渠道', '内容', '时间', '操作'], d.items.map((m) => [
-            m.id, esc(m.role), esc(m.user), esc(m.channel), esc(m.content), fmtTime(m.ts),
+          body = table(['ID', '角色', '用户', '昵称', '渠道', '内容', '时间', '操作'], d.items.map((m) => [
+            m.id, esc(m.role), esc(m.user), esc(m.user_name), esc(m.channel),
+            esc(m.content), fmtTime(m.ts),
             `<button class="mini danger" data-del-msg="${m.id}">删除</button>`]));
         }
         c.innerHTML = `
           <div class="panel">
             <div class="inline" style="margin-bottom:12px">
-              ${[['long', '长期记忆'], ['sessions', '会话摘要'], ['profile', '用户画像'], ['messages', '原始流水']]
+              ${[['core', '核心记忆'], ['long', '长期记忆'], ['facts', '结构化事实'],
+                 ['profile', '用户画像'], ['sessions', '会话摘要'], ['messages', '原始流水']]
                 .map(([k, label]) => `<button class="${tab === k ? '' : 'ghost'} mini" data-tab="${k}">${label}</button>`).join('')}
             </div>
             ${body}
@@ -499,7 +574,64 @@ const PAGES = [
             setMsg(root, '已添加'); draw();
           } catch (e) { setMsg(root, e.message, true); }
         };
+        const coreAddBtn = c.querySelector('#m-core-add');
+        if (coreAddBtn) coreAddBtn.onclick = async () => {
+          try {
+            await api('POST', '/api/memory/core', {
+              content: c.querySelector('#m-core-content').value,
+              importance: parseFloat(c.querySelector('#m-core-imp').value) || 0.8 });
+            setMsg(root, '已添加'); draw();
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+        // ---- 领域知识导入：原文交给模型拆三元组 ----
+        const extractBtn = c.querySelector('#m-fact-extract');
+        if (extractBtn) extractBtn.onclick = async () => {
+          const status = c.querySelector('#m-fact-status');
+          const text = c.querySelector('#m-fact-text').value.trim();
+          if (!text) { setMsg(root, '先粘贴知识原文', true); return; }
+          extractBtn.disabled = true;
+          status.textContent = '模型拆分中，请稍候…';
+          try {
+            const r = await api('POST', '/api/memory/facts/extract', {
+              text,
+              domain: c.querySelector('#m-fact-domain').value.trim(),
+              user: c.querySelector('#m-fact-user').value.trim(),
+            });
+            setMsg(root, `已导入：新增 ${r.added}，覆盖更新 ${r.updated}，跳过 ${r.skipped}`);
+            await draw();
+          } catch (e) {
+            setMsg(root, e.message, true);
+            status.textContent = '';
+          } finally {
+            extractBtn.disabled = false;
+          }
+        };
+        // ---- 直接导入已写好的 JSON 三元组数组 ----
+        const importBtn = c.querySelector('#m-fact-import');
+        if (importBtn) importBtn.onclick = async () => {
+          const raw = c.querySelector('#m-fact-json').value.trim();
+          let items;
+          try {
+            items = JSON.parse(raw);
+          } catch (e) {
+            setMsg(root, 'JSON 解析失败：' + e.message, true);
+            return;
+          }
+          if (!Array.isArray(items) || !items.length) {
+            setMsg(root, '请粘贴一个非空数组', true);
+            return;
+          }
+          try {
+            const r = await api('POST', '/api/memory/facts/import', {
+              items, user: c.querySelector('#m-fact-user').value.trim(),
+            });
+            setMsg(root, `已导入：新增 ${r.added}，覆盖更新 ${r.updated}，跳过 ${r.skipped}`);
+            await draw();
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+        bindDelete(c, root, '[data-del-core]', (id) => `/api/memory/core/${id}`, draw);
         bindDelete(c, root, '[data-del]', (id) => `/api/memory/long/${id}`, draw);
+        bindDelete(c, root, '[data-del-fact]', (id) => `/api/memory/facts/${id}`, draw);
         bindDelete(c, root, '[data-del-session]', (id) => `/api/memory/sessions/${id}`, draw);
         bindDelete(c, root, '[data-del-msg]', (id) => `/api/memory/messages/${id}`, draw);
       };
@@ -577,20 +709,112 @@ const PAGES = [
 
   // ---------------------------------------------------------------- 插件拓展
   {
-    id: 'plugins', label: '插件拓展', desc: '总线上可启停的横切能力',
+    id: 'plugins', label: '插件拓展', desc: '总线上可启停的横切能力（支持热重载/删除/新建）',
     async load(root, c) {
       const d = await api('GET', '/api/plugins');
       const rows = d.plugins.map((p) => [
-        esc(p.name),
+        esc(p.name) + (p.builtin ? ' <span class="badge">内置</span>' : ''),
         p.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge off">已停用</span>',
         p.loaded ? '<span class="badge ok">运行中</span>' : '<span class="badge off">未装载</span>',
         `<button class="mini ${p.enabled ? 'danger' : ''}" data-name="${esc(p.name)}"
-           data-enable="${p.enabled ? '0' : '1'}">${p.enabled ? '停用' : '启用'}</button>`,
+           data-enable="${p.enabled ? '0' : '1'}">${p.enabled ? '停用' : '启用'}</button>
+         <button class="mini ghost" data-reload="${esc(p.name)}">重载</button>
+         ${p.has_settings ? `<button class="mini ghost" data-settings="${esc(p.name)}">设置</button>` : ''}
+         <button class="mini danger" data-del="${esc(p.name)}" ${p.builtin ? 'disabled' : ''}>删除</button>`,
       ]);
       c.innerHTML = `<div class="panel"><h3>已注册插件</h3>
         ${table(['插件', '配置状态', '运行状态', '操作'], rows)}
-        <p class="hint">启停会同时写入运行时设置并立即装载/卸载（scheduler 等支持安全启停）。</p>
+        <p class="hint">启停/重载/删除都会立即生效（热插拔）；内置插件只允许停用或重载。删除会先卸载再删文件。</p>
+      </div>
+      <div id="p-settings"></div>
+      <div class="panel"><h3>新建 / 覆写插件</h3>
+        <div><label>插件名（字母/数字/下划线，如 my_tool）</label>
+          <input id="p-name" placeholder="my_tool"></div>
+        <div><label>源码（必须定义 install(bus, cfg)）</label>
+          <textarea id="p-src" rows="12" style="width:100%;font-family:monospace"
+            placeholder="def install(bus, cfg):&#10;    ...&#10;    return None"></textarea></div>
+        <div class="spacer"></div>
+        <div class="inline">
+          <button id="p-create">保存并热装载</button>
+          <button class="ghost" id="p-load">载入已有插件源码</button>
+        </div>
       </div>`;
+
+      // 插件设置面板：schema 由插件模块自己声明（模块级 SETTINGS），
+      // 前端只按字段类型渲染控件，不做任何插件专属硬编码。
+      const settingsBox = c.querySelector('#p-settings');
+      const renderSettings = (r) => {
+        const fields = (r.schema.fields || []).map((f) => {
+          const key = esc(f.key);
+          const val = r.values ? r.values[f.key] : undefined;
+          const label = esc(f.label || f.key);
+          const help = f.help ? `<p class="hint">${esc(f.help)}</p>` : '';
+          let control = '';
+          if (f.type === 'targets') {
+            // 可选目标 = 可发布目标表 + QQ 默认群；当前值里若有不在列表中的条目
+            // （目标被删除/停用）也补一条，否则保存时会被悄悄丢掉。
+            const opts = (r.options.targets || []).slice();
+            const cur = Array.isArray(val) ? val : [];
+            cur.forEach((v) => {
+              if (!opts.some((o) => o.value === v)) opts.push({ value: v, label: v + '（未登记/已停用）' });
+            });
+            control = opts.length
+              ? `<div data-targets="${key}" style="display:flex;flex-direction:column;gap:6px">`
+                + opts.map((o) => `<label class="checkbox" style="margin:0">
+                     <input type="checkbox" value="${esc(o.value)}" ${cur.includes(o.value) ? 'checked' : ''}>
+                     <span>${esc(o.label)}</span></label>`).join('')
+                + '</div>'
+              : '<p class="hint">暂无可选目标：请先在「可发布目标」页添加，或配置 QQ 默认群。</p>';
+          } else if (f.type === 'bool') {
+            control = `<div class="checkbox"><input type="checkbox" data-k="${key}" ${val ? 'checked' : ''}></div>`;
+          } else if (f.type === 'select') {
+            const opts = (f.options || []).map((o) => (typeof o === 'object' ? o : { value: o, label: o }));
+            control = `<select data-k="${key}">${opts.map((o) => `<option value="${esc(o.value)}"
+              ${String(o.value) === String(val) ? 'selected' : ''}>${esc(o.label || o.value)}</option>`).join('')}</select>`;
+          } else if (f.type === 'number') {
+            control = `<input type="number" data-k="${key}" value="${esc(val)}" style="max-width:180px">`;
+          } else if (f.type === 'textarea') {
+            control = `<textarea data-k="${key}" rows="4" style="width:100%">${esc(val)}</textarea>`;
+          } else {
+            control = `<input data-k="${key}" value="${esc(val)}">`;
+          }
+          return `<div style="margin-bottom:12px"><label>${label}</label>${control}${help}</div>`;
+        }).join('');
+        settingsBox.innerHTML = `<div class="panel"><h3>${esc(r.schema.title || r.name)} · 设置</h3>
+          ${fields || '<p class="hint">该插件未声明可配置字段。</p>'}
+          <div class="spacer"></div>
+          <div class="inline"><button id="ps-save">保存设置</button>
+            <button class="ghost" id="ps-close">收起</button></div>
+          <p class="hint">保存后立即热重载该插件，新设置无需重启即可生效。</p></div>`;
+        settingsBox.querySelector('#ps-close').onclick = () => { settingsBox.innerHTML = ''; };
+        settingsBox.querySelector('#ps-save').onclick = async () => {
+          // 按字段类型逐个取值，避免把 DOM 里的字符串原样写库
+          const values = {};
+          (r.schema.fields || []).forEach((f) => {
+            if (f.type === 'targets') {
+              values[f.key] = Array.from(settingsBox.querySelectorAll(`[data-targets="${f.key}"] input:checked`))
+                .map((x) => x.value);
+            } else if (f.type === 'bool') {
+              values[f.key] = settingsBox.querySelector(`[data-k="${f.key}"]`).checked;
+            } else {
+              values[f.key] = settingsBox.querySelector(`[data-k="${f.key}"]`).value;
+            }
+          });
+          try {
+            renderSettings(await api('PUT', `/api/plugins/${encodeURIComponent(r.name)}/settings`, { values }));
+            setMsg(root, '已保存并热重载');
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+      };
+      c.querySelectorAll('button[data-settings]').forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            renderSettings(await api('GET',
+              `/api/plugins/${encodeURIComponent(btn.dataset.settings)}/settings`));
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+      });
+
       c.querySelectorAll('button[data-name]').forEach((btn) => {
         btn.onclick = async () => {
           try {
@@ -600,6 +824,40 @@ const PAGES = [
           } catch (e) { setMsg(root, e.message, true); }
         };
       });
+      c.querySelectorAll('button[data-reload]').forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            await api('POST', `/api/plugins/${btn.dataset.reload}/reload`, {});
+            setMsg(root, '已热重载'); this.load(root, c);
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+      });
+      c.querySelectorAll('button[data-del]').forEach((btn) => {
+        btn.onclick = async () => {
+          if (!confirm(`删除插件 ${btn.dataset.del}？文件会被移除。`)) return;
+          try {
+            await api('POST', `/api/plugins/${btn.dataset.del}/delete`, {});
+            setMsg(root, '已删除'); this.load(root, c);
+          } catch (e) { setMsg(root, e.message, true); }
+        };
+      });
+      c.querySelector('#p-load').onclick = async () => {
+        const name = c.querySelector('#p-name').value.trim();
+        if (!name) { setMsg(root, '先填插件名', true); return; }
+        try {
+          const r = await api('GET', `/api/plugins/${encodeURIComponent(name)}/source`);
+          c.querySelector('#p-src').value = r.source;
+          setMsg(root, '已载入源码');
+        } catch (e) { setMsg(root, e.message, true); }
+      };
+      c.querySelector('#p-create').onclick = async () => {
+        const name = c.querySelector('#p-name').value.trim();
+        const source = c.querySelector('#p-src').value;
+        try {
+          await api('POST', '/api/plugins', { name, source, enabled: true });
+          setMsg(root, '已保存并热装载'); this.load(root, c);
+        } catch (e) { setMsg(root, e.message, true); }
+      };
     },
   },
 
@@ -746,6 +1004,8 @@ const PAGES = [
             <div><label>会话摘要触发消息数</label><input id="s-maxmsgs" type="number" value="${mem.session_max_msgs}"></div>
             <div><label>会话空闲触发（分钟）</label><input id="s-idle" type="number" value="${mem.session_idle_min}"></div>
             <div><label>时间衰减半衰期（天）</label><input id="s-half" type="number" value="${mem.recall_half_life_days}"></div>
+            <div><label>核心记忆上限（条，始终注入）</label><input id="s-core" type="number" value="${mem.core_limit}"></div>
+            <div><label>结构化事实召回条数</label><input id="s-facts" type="number" value="${mem.facts_top_k}"></div>
           </div>
         </div>
         <div class="panel"><h3>在线聊天（阶段三）</h3>
@@ -783,7 +1043,8 @@ const PAGES = [
               backoff_factor: num('#s-backoff'), send_fail_limit: num('#s-fail') },
             memory: { working_window: num('#s-win'), recall_top_k: num('#s-topk'),
               session_max_msgs: num('#s-maxmsgs'), session_idle_min: num('#s-idle'),
-              recall_half_life_days: num('#s-half') },
+              recall_half_life_days: num('#s-half'), core_limit: num('#s-core'),
+              facts_top_k: num('#s-facts') },
             web: { host: c.querySelector('#s-host').value.trim(), port: num('#s-port'),
               session_hours: num('#s-hours') },
             qq: { api_base: qq.api_base },

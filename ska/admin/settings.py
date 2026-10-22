@@ -34,7 +34,16 @@ logger = logging.getLogger(__name__)
 APP_KEYS = ("bpm", "persona_profile", "tools", "plugins", "channels")
 
 # 覆盖层允许的小节白名单（防止前端塞入任意键）
-SECTIONS = ("app", "throttle", "memory", "agent", "qq", "web", "roles", "webchat")
+SECTIONS = ("app", "throttle", "memory", "agent", "qq", "web", "roles", "webchat",
+            "dialog")  # 白名单（plugin:* 由 is_allowed_section 前缀放行）
+# 插件自带设置项统一存成 "plugin:<插件名>" 小节：插件是运行期新增的，
+# 无法预先列进 SECTIONS，故按前缀放行（仍限定前缀，不允许任意键）。
+PLUGIN_SECTION_PREFIX = "plugin:"
+
+
+def is_allowed_section(key: str) -> bool:
+    """该小节名是否允许被后台覆盖层保存/读取。"""
+    return key in SECTIONS or key.startswith(PLUGIN_SECTION_PREFIX)
 
 # roles 小节默认值：聊天用户等级规则的全局设置（决策 D6）
 DEFAULT_ROLES: dict[str, Any] = {
@@ -46,6 +55,8 @@ DEFAULT_ROLES: dict[str, Any] = {
 DEFAULT_AGENT: dict[str, Any] = {"allow_tools": True, "max_steps": 5}
 
 # qq 小节的默认值（阶段二默认走 SnowLuma，见方案 §5.5）
+# auto_start 系列（阶段三增强）：启用 QQ 且探测不到适配器时，按命令自动拉起 SnowLuma；
+# 只在「本进程真的拉起过」时才在退出/停用时关闭它，不会误杀用户手动启动的实例。
 DEFAULT_QQ: dict[str, Any] = {
     "enabled": False,
     "transport": "http",
@@ -58,6 +69,11 @@ DEFAULT_QQ: dict[str, Any] = {
     "default_user": "",
     "reconnect_min": 1,
     "reconnect_max": 60,
+    "auto_start": False,
+    "snowluma_command": "",
+    "snowluma_cwd": "",
+    "snowluma_webui_port": 0,
+    "startup_timeout": 60,
 }
 
 # web 小节默认值（D5：5098，避开 SnowLuma 的 5099）
@@ -83,9 +99,12 @@ DEFAULT_WEBCHAT: dict[str, Any] = {
 # 有「内置默认值」的小节：合并顺序 = 内置默认 → config.yaml → 后台覆盖层。
 # 这样即使 config.yaml 里没写这些小节，也能拿到可用默认值；
 # 写了就作为初值（后台可再覆盖），语义最直观。
+# 对话窗口（消息批处理）默认值：推理期间同一聊天堆积的消息合并成一批
+DEFAULT_DIALOG: dict[str, Any] = {"batch_enabled": True, "batch_max_messages": 12}
+
 _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "agent": DEFAULT_AGENT, "qq": DEFAULT_QQ, "web": DEFAULT_WEB,
-    "roles": DEFAULT_ROLES, "webchat": DEFAULT_WEBCHAT,
+    "roles": DEFAULT_ROLES, "webchat": DEFAULT_WEBCHAT, "dialog": DEFAULT_DIALOG,
 }
 
 
@@ -101,7 +120,7 @@ class RuntimeSettings:
         """用 settings 表的数据初始化覆盖层（启动阶段调用，此时无事件循环）。"""
         clean: dict[str, dict[str, Any]] = {}
         for key, value in (stored or {}).items():
-            if key in SECTIONS and isinstance(value, dict):
+            if is_allowed_section(key) and isinstance(value, dict):
                 clean[key] = value
         self._over = clean
         self._apply_persona_override()          # 让 Config.build_system_prompt 也看到覆盖值

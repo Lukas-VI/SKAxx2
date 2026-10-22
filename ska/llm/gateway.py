@@ -77,12 +77,12 @@ class LLMGateway:
     def _apply(self, cfg: dict[str, Any]) -> None:
         """把配置 dict 的字段写入实例（__init__ 与 reconfigure 共用）。"""
         # 去掉结尾斜杠，拼 URL 时避免出现双斜杠
-        self.base_url = str(cfg.get("base_url", "http://localhost:11434/v1")).rstrip("/")
+        self.base_url = str(cfg.get("base_url", "http://localhost:8080/v1")).rstrip("/")
         self.api_key = str(cfg.get("api_key", ""))
         self.model = str(cfg.get("model", "qwen2.5:7b"))
         self.default_temperature = float(cfg.get("temperature", 0.8))
         self.max_tokens = int(cfg.get("max_tokens", 1024))
-        self.timeout = float(cfg.get("timeout", 60))
+        self.timeout = float(cfg.get("timeout", 6000))
         self.retry = int(cfg.get("retry", 1))   # 供 structured 层读取
         self.provider_id = str(cfg.get("id", "") or cfg.get("provider_id", ""))
 

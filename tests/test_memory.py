@@ -124,6 +124,24 @@ class TestMemoryStore(unittest.IsolatedAsyncioTestCase):
         await self.store.pin_core("全局核心记忆", user="")
         self.assertEqual(await self.store.list_core(user="u1"), ["全局核心记忆"])
 
+    async def test_list_core_entries_and_delete_by_id(self):
+        """后台列表要拿到整行（id/重要性/归属/时间），并支持按 id 删除。"""
+        core_id = await self.store.pin_core("对方叫我小赛", user="u1", importance=0.9)
+        rows = await self.store.list_core_entries(user="u1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], core_id)
+        self.assertEqual(rows[0]["importance"], 0.9)
+        self.assertEqual(rows[0]["user"], "u1")
+        self.assertTrue(await self.store.delete_core(core_id))
+        self.assertEqual(await self.store.list_core_entries(user="u1"), [])
+
+    async def test_delete_fact_by_id(self):
+        """结构化事实支持按 id 删除（后台纠错）。"""
+        await self.store.upsert_fact("对方", "喜欢", "酒心巧克力")
+        facts = await self.store.list_facts()
+        self.assertTrue(await self.store.delete_fact(facts[0]["id"]))
+        self.assertEqual(await self.store.list_facts(), [])
+
     # ------------------------------------------------------------------ 记忆块组装（三层）
     async def test_recall_block_includes_core_and_facts(self):
         """记忆块应同时包含「始终记得的核心记忆」与「检索到的结构化事实」。"""

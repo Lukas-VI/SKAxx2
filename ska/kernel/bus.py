@@ -49,6 +49,22 @@ class EventBus:
         """订阅某主题。可多次调用注册多个处理者，按注册顺序依次调用。"""
         self._handlers[topic].append(handler)
 
+    def unsubscribe(self, topic: str, handler: Handler) -> bool:
+        """取消订阅（插件热卸载/热重载时使用）；返回是否真的移除了。
+
+        为什么需要它：插件卸载时若不摘掉订阅，旧实例会继续收到事件——
+        热重载后就会出现「同一个事件被新旧两份插件各处理一次」的幽灵重复。
+        按对象身份移除，且容错（重复取消不抛异常）。
+        """
+        handlers = self._handlers.get(topic)
+        if not handlers:
+            return False
+        for i, existing in enumerate(handlers):
+            if existing is handler:
+                del handlers[i]
+                return True
+        return False
+
     # ------------------------------------------------------------------ 投递
     async def publish(self, event: Event) -> None:
         """投递「输入类」事件：先通知该主题订阅者，再入队并唤醒主循环。

@@ -63,7 +63,7 @@ webchat:
 # 说明：这些值只是「首次启动的初值」，之后可在后台「绑定 QQ」页热改
 #       （后台改动写进 data/admin.db 的 settings 覆盖层，不改本文件）。
 qq:
-  enabled: false                       # 默认不启用（没有 SnowLuma 时开启会反复探测报错）
+  enabled: true                        # 已部署 SnowLuma，启用 QQ 渠道
   transport: http                      # http（默认）| ws（本阶段仅留接口，未实现）
   api_base: "http://127.0.0.1:3000"    # SnowLuma httpServers 地址（默认 3000）
   access_token: ""                     # SnowLuma 的鉴权 token（Bearer），可留空
@@ -74,6 +74,17 @@ qq:
   default_user: ""                     # 私聊默认对象 user_id
   reconnect_min: 1                     # 重连退避起始秒数（指数增长）
   reconnect_max: 60                    # 重连退避上限秒数
+  # --- 自动启动 SnowLuma（阶段三增强）---
+  # 开启后：只要 qq.enabled=true，启动时会先探测 api_base；
+  #   探测不到 → 按 snowluma_command 拉起它，最多等 startup_timeout 秒就绪；
+  #   已经能连通 → 直接复用，绝不重复启动（避免抢端口）。
+  # 退出/停用/关闭 auto_start 时，只会关掉「本进程自己拉起」的实例。
+  auto_start: true                     # 是否在启用 QQ 时自动拉起 SnowLuma
+  # 这里直接用发行包自带的 node.exe，避免依赖 PATH 里的 node，也绕开 launcher.bat 的 pause
+  snowluma_command: "D:/py/SKA/SnowLuma/node.exe D:/py/SKA/SnowLuma/index.mjs"
+  snowluma_cwd: "D:/py/SKA/SnowLuma"   # 启动工作目录（config/ 等相对路径基于此）
+  snowluma_webui_port: 5099            # SnowLuma WebUI 端口（已启动但未登录时避免重复拉起）
+  startup_timeout: 60                  # 拉起后等待 HTTP API 就绪的秒数
 
 # ---------------------------------------------------------------------------
 # WebUI 管理后台（零依赖：标准库 http.server + 原生单页，见方案 §5.3 / 决策 D1/D5）
@@ -95,6 +106,9 @@ tools:
   - code_read     # 编码智能体（阶段三 3D）：读文件（受 code 小节白名单约束）
   - code_write    #                          写文件
   - code_run      #                          执行命令（终端可用；带沙盒 + 超时）
+  - plugin_ops    # 插件自举：读写/热重载/启停/删除插件（写 ska/plugins 下单文件插件）
+  - image_send    # 图片 IO（阶段四）：把本地路径/URL 的图片附到本轮回复里一起发出
+  - giphy_search  # 联网检索 GIF（阶段四）：本地表情包没有合适的动图时用
   # 注：MCP 外部工具不在此列——它们由运行期从 mcp.servers 动态发现并合入工具表。
 
 # ---------------------------------------------------------------------------
@@ -109,7 +123,7 @@ tools:
 # 想更严：后台「智能体权限」页把对应工具的最小可用等级设为 admin。
 code:
   enabled: true                        # 总闸：已开启（终端命令可用）；改回 false 即全局禁用
-  allow_dirs: [".","D:/py/SKA/SKAxx2/ska/plugins", "E:/SKA-sandbox"]                    # 工作目录白名单：相对路径按**项目根**解析，"." 即项目根
+  allow_dirs: ["D:/py/SKA/SKAxx2/ska/plugins", "E:/SKA-sandbox", "C:/Users/lupo/Pictures/meme"]                    # 工作目录白名单：相对路径按**项目根**解析，"." 即项目根
                                        #   也可填绝对路径，如 ["D:/workdir"]；为空则一律拒绝执行
   timeout: 10                          # code_run 单条命令超时（秒）
   sandbox: true                        # 沙盒：清洗环境变量 + 危险命令黑名单（默认开，建议保持）
@@ -153,6 +167,16 @@ throttle:
   send_fail_limit: 3           # 发送连续失败次数，达到则熔断，等重连事件恢复
 
 # ---------------------------------------------------------------------------
+# 对话窗口（消息批处理）
+# ---------------------------------------------------------------------------
+# 模型推理一条消息期间，同一聊天里可能又来了好几条消息。开启后这些小消息
+# 会在下一轮合并成「一批」一次性输入（文字按行拼接、图片合并后分批解析），
+# 只推理、只回复一次，避免在高频群里一句接一句永远追不上。
+dialog:
+  batch_enabled: true           # 是否开启对话窗口合并（关闭=逐条处理，旧行为）
+  batch_max_messages: 12        # 一批最多保留最近多少条（超出丢最旧，避免无限补课）
+
+# ---------------------------------------------------------------------------
 # 记忆（第三期）
 # ---------------------------------------------------------------------------
 memory:
@@ -166,11 +190,34 @@ memory:
   facts_top_k: 4               # 结构化事实召回条数（Mem0 风格三元组，去重后）
 
 # ---------------------------------------------------------------------------
+# 图片 IO 与本地表情包库（阶段四）
+# ---------------------------------------------------------------------------
+# 两条链路共用这一小节：
+#   来图：QQ image/mface 段 → 下载 → sha256 去重 → 视觉解析 → 表情包入库（普通照片只描述）
+#   发图：Mind/工具给出的本地路径或 URL → 渠道组装 OneBot image 段（本地转 base64://）
+media:
+  vision_enabled: true          # 是否启用视觉解析（关掉=只收集元数据，不做模型解析）
+  vision_model: ""              # 视觉模型名；空=复用主网关（主模型需支持图片输入）
+  vision_base_url: ""           # 视觉端点；空=跟随主网关
+  vision_api_key: ""            # 视觉端点密钥；空=跟随主网关
+  vision_max_tokens: 1200       # 视觉回答的 token 上限（思考型模型会先耗 token 推理，给小了会空回复）
+  max_image_bytes: 5242880      # 单张图片最大字节数（5MB），超过拒收
+  max_images_per_message: 4     # 每条消息最多解析/发送几张图（防刷图拖垮一轮推理）
+  sticker_dir: "data/stickers"  # 表情包落盘目录（相对路径按项目根解析；自动加入发送白名单）
+  sticker_catalog_size: 12      # 决策提示词里最多列出多少个表情包的含义摘要
+  allow_dirs:                   # 允许发送的本地目录白名单（为空=只允许 URL 与表情包目录）
+    - "E:/SKA-sandbox"
+    - "data/out"
+    - "D:/py/SKA/SKAxx2/ska/plugins"
+    - "C:/Users/lupo/Pictures/meme"
+  giphy_api_key: ""             # Giphy 检索密钥（https://developers.giphy.com/；空=该工具只提示未配置）
+
+# ---------------------------------------------------------------------------
 # 执行者（AgentLoop）与工具总开关（阶段二「智能体权限」页可热改）
 # ---------------------------------------------------------------------------
 agent:
   allow_tools: true            # 全局是否允许调用工具（关掉则 AgentLoop 一步不用工具）
-  max_steps: 50                 # 单轮工具链最大步数（防「模型自循环」失控）
+  max_steps: 100                 # 单轮工具链最大步数（防「模型自循环」失控）
 
 # ---------------------------------------------------------------------------
 # 聊天用户等级规则（阶段二「权限管理」页可热改，见方案 §5.7 / 决策 D6）

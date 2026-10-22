@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import yaml
 
@@ -17,8 +18,11 @@ from ska.admin.policy import LEVELS, Policy, level_rank
 from ska.admin.service import AdminService
 from ska.admin.settings import RuntimeSettings
 from ska.admin.store import AdminStore
+from ska.kernel.bus import EventBus
 from ska.kernel.config import write_persona_default
 from ska.kernel.packet import CoreInput
+from ska.memory.store import MemoryStore
+from ska.plugins.manager import PluginManager
 from ska.web.auth import AuthService, hash_password, role_at_least, verify_password
 
 
@@ -361,6 +365,121 @@ class TestLocalConfigGeneration(unittest.TestCase):
             self.assertTrue(providers.saved)                       # 提供商清单已落盘
             self.assertTrue(providers.path.exists())
             self.assertIn("config/providers.yaml", created)        # 原本不存在 → 记为新建
+
+
+class _FakeStickerBook:
+    """表情包库替身：只关心「服务层是否正确统计 + 是否解码后转发」。"""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    async def import_one(self, data: bytes, *, name: str = "", user: str = "",
+                         channel: str = "webui") -> dict:
+        self.names.append(name)
+        if name == "boom.png":
+            raise RuntimeError("模拟单张失败")
+        return {"status": "added", "id": len(self.names), "description": name}
+
+
+class TestKnowledgeImport(unittest.IsolatedAsyncioTestCase):
+    """阶段五：结构化事实批量导入 + 表情包文件夹批量导入的服务层。"""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.memory = MemoryStore(os.path.join(self._tmp.name, "t.db"))
+        self.book = _FakeStickerBook()
+        self.svc = AdminService(
+            app={"cfg": _StubCfg({}), "stickers": self.book},
+            store=None, memory=self.memory, settings=None,
+            providers=None, policy=None)
+
+    async def asyncTearDown(self):
+        await self.memory.close()
+        self._tmp.cleanup()
+
+    async def test_memory_facts_import_counts(self):
+        items = [
+            {"subject": "小明", "predicate": "喜欢", "object": "猫", "fact": "喜欢猫"},
+            {"subject": "小红", "predicate": "讨厌", "object": "辣"},
+            {"subject": "缺客体", "predicate": "有"},          # 非法：跳过
+        ]
+        first = await self.svc.memory_facts_import(items, user="u1")
+        self.assertEqual(first, {"added": 2, "updated": 0, "skipped": 1})
+        # 同槽位再导入一次：不新增，而是覆盖更新
+        second = await self.svc.memory_facts_import(items[:2], user="u1")
+        self.assertEqual(second, {"added": 0, "updated": 2, "skipped": 0})
+        facts = await self.memory.list_facts(user="u1")
+        self.assertEqual(len(facts), 2)
+
+    async def test_stickers_import_decodes_and_counts_failures(self):
+        b64 = "data:image/png;base64," + "iVBORw0KGgo="
+        result = await self.svc.stickers_import([
+            {"name": "a.png", "data": b64},
+            {"name": "boom.png", "data": b64},        # import_one 抛异常 → failed
+            {"name": "empty.png", "data": ""},        # 空数据 → failed
+            "坏结构",                                  # 非对象 → failed
+        ])
+        self.assertEqual(result, {"added": 1, "skipped": 0, "failed": 3})
+        self.assertEqual(self.book.names, ["a.png", "boom.png"])   # 空数据不再转发
+
+    async def test_stickers_read_without_book_returns_empty(self):
+        svc = AdminService(app={}, store=None, memory=self.memory, settings=None,
+                           providers=None, policy=None)
+        self.assertEqual(await svc.stickers(), [])                 # 未启用 → 空列表而非报错
+        self.assertIsNone(await svc.sticker_image(1))
+
+
+# =========================================================================== 插件设置项
+class TestPluginSettingsService(unittest.IsolatedAsyncioTestCase):
+    """后台「插件设置」：schema + 当前值 + 可选目标，保存后写库并热重载。"""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = AdminStore(os.path.join(self._tmp.name, "admin.db"))
+        cfg = _StubCfg({"qq": {"default_group": "999"}})
+        self.settings = RuntimeSettings(cfg)
+        self.settings.load_sync({})
+        # plugin_map 里有 scheduler：保存设置时应当走热重载路径
+        self.app = {"bus": EventBus(), "cfg": cfg, "tools": {},
+                    "plugin_map": {"scheduler": object()}}
+        self.mgr = PluginManager(self.app, settings=self.settings, store=self.store)
+        self.app["plugin_manager"] = self.mgr
+        self.svc = AdminService(app=self.app, store=self.store, memory=None,
+                                settings=self.settings, providers=None, policy=None)
+
+    async def asyncTearDown(self) -> None:
+        await self.store.close()
+        self._tmp.cleanup()
+
+    async def test_read_returns_defaults_and_qq_group_option(self):
+        r = await self.svc.plugin_settings("scheduler")
+        self.assertEqual(r["values"], {"targets": []})               # 默认空 → 退回默认群
+        self.assertEqual(r["schema"]["fields"][0]["type"], "targets")
+        self.assertEqual(r["options"]["targets"][0]["value"], "qq|group|999")
+
+    async def test_read_includes_registered_targets(self):
+        await self.store.add_target("qq", "group", "123", "测试群", enabled=True)
+        await self.store.add_target("qq", "user", "456", "好友", enabled=False)
+        r = await self.svc.plugin_settings("scheduler")
+        values = [o["value"] for o in r["options"]["targets"]]
+        self.assertIn("qq|group|999", values)                        # 默认群排在最前
+        self.assertIn("qq|group|123", values)
+        self.assertNotIn("qq|user|456", values)                      # 已停用的目标不给出
+
+    async def test_update_persists_and_reloads(self):
+        with patch.object(PluginManager, "reload", new=AsyncMock()) as reload:
+            r = await self.svc.update_plugin_settings(
+                "scheduler", {"targets": ["qq|group|123"]})
+        reload.assert_awaited_once_with("scheduler")                 # 运行中插件立即热重载
+        self.assertEqual(r["values"], {"targets": ["qq|group|123"]})
+        stored = await self.store.all_settings()
+        self.assertEqual(stored["plugin:scheduler"], {"targets": ["qq|group|123"]})
+        self.assertEqual(self.settings.section("plugin:scheduler"),
+                         {"targets": ["qq|group|123"]})
+
+    async def test_update_rejects_unknown_field(self):
+        with self.assertRaises(ValueError):
+            await self.svc.update_plugin_settings("scheduler", {"nope": 1})
 
 
 if __name__ == "__main__":

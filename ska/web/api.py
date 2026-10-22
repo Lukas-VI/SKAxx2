@@ -168,6 +168,11 @@ class API:
             R("PUT", "/api/users/{channel}/{user_id}", self.h_user_update, "admin"),
 
             # ---- 6. 记忆管理 ----
+            R("GET", "/api/memory/core", self.h_mem_core, "viewer"),
+            R("POST", "/api/memory/core", self.h_mem_core_add, "admin"),
+            R("DELETE", "/api/memory/core/{id}", self.h_mem_core_delete, "admin"),
+            R("GET", "/api/memory/facts", self.h_mem_facts, "viewer"),
+            R("DELETE", "/api/memory/facts/{id}", self.h_mem_fact_delete, "admin"),
             R("GET", "/api/memory/long", self.h_mem_long, "viewer"),
             R("POST", "/api/memory/long", self.h_mem_long_add, "admin"),
             R("PUT", "/api/memory/long/{id}", self.h_mem_long_update, "admin"),
@@ -188,7 +193,14 @@ class API:
 
             # ---- 8. 插件拓展 ----
             R("GET", "/api/plugins", self.h_plugins, "viewer"),
+            R("POST", "/api/plugins", self.h_plugin_create, "admin"),
             R("POST", "/api/plugins/{name}/toggle", self.h_plugin_toggle, "admin"),
+            R("POST", "/api/plugins/{name}/reload", self.h_plugin_reload, "admin"),
+            R("POST", "/api/plugins/{name}/delete", self.h_plugin_delete, "admin"),
+            R("GET", "/api/plugins/{name}/source", self.h_plugin_source, "viewer"),
+            # 插件自带设置项：GET 读 schema + 当前值 + 可选目标，PUT 保存并热重载
+            R("GET", "/api/plugins/{name}/settings", self.h_plugin_settings, "viewer"),
+            R("PUT", "/api/plugins/{name}/settings", self.h_plugin_settings_update, "admin"),
 
             # ---- 9. 智能体权限（工具 + 全局开关）----
             R("GET", "/api/tools", self.h_tools, "viewer"),
@@ -221,6 +233,20 @@ class API:
             # ---- 13. MindLine 轨迹（阶段三 §4.4）----
             R("GET", "/api/trace", self.h_trace, "viewer"),
             R("DELETE", "/api/trace", self.h_trace_clear, "admin"),
+
+            # ---- 14. 表情包管理（阶段五）----
+            # 列表/缩略图 viewer 可见；改嵌入信息、删除、批量导入要求 admin。
+            # 注意顺序：/api/stickers/import 必须在 /api/stickers/{id} 之前声明，
+            # 否则 POST 会被参数路由吞掉（虽然方法不同，但保持「具体在前」的约定）。
+            R("GET", "/api/stickers", self.h_stickers, "viewer"),
+            R("POST", "/api/stickers/import", self.h_stickers_import, "admin"),
+            R("GET", "/api/stickers/{id}/image", self.h_sticker_image, "viewer"),
+            R("PUT", "/api/stickers/{id}", self.h_sticker_update, "admin"),
+            R("DELETE", "/api/stickers/{id}", self.h_sticker_delete, "admin"),
+
+            # ---- 15. 结构化事实导入（领域知识 → 模型拆三元组 → 入库）----
+            R("POST", "/api/memory/facts/import", self.h_mem_facts_import, "admin"),
+            R("POST", "/api/memory/facts/extract", self.h_mem_facts_extract, "admin"),
         ]
 
     # ------------------------------------------------------------------ 分发入口
@@ -410,6 +436,86 @@ class API:
         return Response.ok({"user": row})
 
     # ================================================================== 记忆
+    async def h_mem_core(self, req: Request, params: dict[str, str]) -> Response:
+        """核心记忆列表：与长期记忆分开，Agent pin 的内容在这里能对上号。"""
+        rows = await self.service.memory_core(
+            limit=_as_int(str(req.q("limit", "100")), 100),
+            user=str(req.q("user", "")))
+        return Response.ok({"items": rows})
+
+    async def h_mem_core_add(self, req: Request, params: dict[str, str]) -> Response:
+        data = req.json()
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise _APIError(400, "content 不能为空")
+        created = await self.service.memory_core_add(
+            content, importance=_as_float(data.get("importance"), 0.8),
+            user=str(data.get("user") or ""))
+        return Response.ok(created)
+
+    async def h_mem_core_delete(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"deleted": await self.service.memory_core_delete(int(params["id"]))})
+
+    async def h_mem_facts(self, req: Request, params: dict[str, str]) -> Response:
+        """结构化事实列表（Mem0 风格三元组）。"""
+        rows = await self.service.memory_facts(
+            limit=_as_int(str(req.q("limit", "200")), 200),
+            user=str(req.q("user", "")))
+        return Response.ok({"items": rows})
+
+    async def h_mem_fact_delete(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"deleted": await self.service.memory_fact_delete(int(params["id"]))})
+
+    async def h_mem_facts_import(self, req: Request, params: dict[str, str]) -> Response:
+        """直接导入 JSON 三元组数组（已由人/模型写好）。"""
+        data = req.json()
+        items = data.get("items")
+        if not isinstance(items, list) or not items:
+            raise _APIError(400, "items 不能为空")
+        result = await self.service.memory_facts_import(
+            items, user=str(data.get("user") or ""))
+        return Response.ok(result)
+
+    async def h_mem_facts_extract(self, req: Request, params: dict[str, str]) -> Response:
+        """贴一段领域知识，让模型拆成结构化事实并导入。"""
+        data = req.json()
+        result = await self.service.memory_facts_extract(
+            str(data.get("text") or ""), user=str(data.get("user") or ""),
+            domain=str(data.get("domain") or ""))
+        return Response.ok(result)
+
+    # ================================================================== 表情包管理
+    async def h_stickers(self, req: Request, params: dict[str, str]) -> Response:
+        rows = await self.service.stickers(
+            limit=_as_int(str(req.q("limit", "200")), 200))
+        return Response.ok({"items": rows})
+
+    async def h_sticker_update(self, req: Request, params: dict[str, str]) -> Response:
+        data = req.json()
+        ok = await self.service.sticker_update(int(params["id"]), data)
+        return Response.ok({"updated": ok})
+
+    async def h_sticker_delete(self, req: Request, params: dict[str, str]) -> Response:
+        return Response.ok({"deleted": await self.service.sticker_delete(int(params["id"]))})
+
+    async def h_sticker_image(self, req: Request, params: dict[str, str]) -> Response:
+        """返回表情包原图（前端列表缩略图用；只允许读库目录内的文件）。"""
+        got = await self.service.sticker_image(int(params["id"]))
+        if got is None:
+            return Response.error(404, "图片不存在")
+        data, mime = got
+        return Response.raw(200, data, mime)
+
+    async def h_stickers_import(self, req: Request, params: dict[str, str]) -> Response:
+        """批量导入：前端把文件夹里的图片读成 base64 分批提交。"""
+        data = req.json()
+        items = data.get("items")
+        if not isinstance(items, list) or not items:
+            raise _APIError(400, "items 不能为空")
+        result = await self.service.stickers_import(
+            items, user=str(data.get("user") or ""))
+        return Response.ok(result)
+
     async def h_mem_long(self, req: Request, params: dict[str, str]) -> Response:
         rows = await self.service.memory_long(
             limit=_as_int(str(req.q("limit", "100")), 100),
@@ -498,6 +604,41 @@ class API:
     async def h_plugin_toggle(self, req: Request, params: dict[str, str]) -> Response:
         enabled = bool(req.json().get("enabled", True))
         return Response.ok(await self.service.toggle_plugin(params["name"], enabled))
+
+    async def h_plugin_reload(self, req: Request, params: dict[str, str]) -> Response:
+        """热重载：改完插件源码后调用，立即按磁盘内容重新装载。"""
+        return Response.ok(await self.service.reload_plugin(params["name"]))
+
+    async def h_plugin_delete(self, req: Request, params: dict[str, str]) -> Response:
+        """删除插件：先卸载再删文件（内置插件会被拒绝并返回 400）。"""
+        return Response.ok(await self.service.delete_plugin(params["name"]))
+
+    async def h_plugin_create(self, req: Request, params: dict[str, str]) -> Response:
+        """新建/覆写插件并热装载（body: {name, source, enabled?}）。"""
+        data = req.json()
+        name = str(data.get("name") or "").strip()
+        source = str(data.get("source") or "")
+        if not name or not source:
+            return Response.error(400, "name 与 source 均不能为空")
+        return Response.ok(await self.service.create_plugin(
+            name, source, enabled=bool(data.get("enabled", True))))
+
+    async def h_plugin_source(self, req: Request, params: dict[str, str]) -> Response:
+        """读取插件源码（后台「载入已有插件」用）。"""
+        return Response.ok(await self.service.plugin_source(params["name"]))
+
+    async def h_plugin_settings(self, req: Request, params: dict[str, str]) -> Response:
+        """读取插件设置项：schema 供前端生成表单，values 为当前生效值。"""
+        return Response.ok(await self.service.plugin_settings(params["name"]))
+
+    async def h_plugin_settings_update(self, req: Request,
+                                       params: dict[str, str]) -> Response:
+        """保存插件设置项（body: {values: {...}}）；校验失败按 400 返回原因。"""
+        values = req.json().get("values")
+        if not isinstance(values, dict):
+            return Response.error(400, "values 必须是对象")
+        return Response.ok(await self.service.update_plugin_settings(
+            params["name"], values))
 
     # ================================================================== 工具 / 智能体
     async def h_tools(self, req: Request, params: dict[str, str]) -> Response:

@@ -114,6 +114,28 @@ def build() -> dict[str, Any]:
     # ChatHub 也订阅轨迹：把上下文占用 token 回填到会话状态条
     bus.subscribe(TOPIC_TRACE, lambda ev: hub.on_trace(ev.payload))
 
+    # ---- 图片 IO 与本地表情包库（阶段四）----
+    # 视觉解析允许单独指定多模态端点（media.vision_model）；不指定就复用主网关
+    # （主模型不支持图片时会自动降级为「未解析」，不会打断对话）。
+    from ska.media import StickerBook, VisionDescriber
+    media_cfg = settings.section("media") if settings is not None else cfg.section("media")
+    vision_gateway = gateway
+    if str(media_cfg.get("vision_model") or "").strip():
+        from ska.llm.gateway import LLMGateway
+        vision_gateway = LLMGateway({
+            "id": "vision",
+            "base_url": str(media_cfg.get("vision_base_url")
+                            or cfg.llm.get("base_url", "")),
+            "api_key": str(media_cfg.get("vision_api_key")
+                           or cfg.llm.get("api_key", "")),
+            "model": str(media_cfg.get("vision_model")),
+            "max_tokens": int(media_cfg.get("vision_max_tokens", 400)),
+            "timeout": float(cfg.llm.get("timeout", 60)),
+        })
+    vision = VisionDescriber(vision_gateway, media_cfg)
+    # store 不可用时不做表情包库（无库可存），Mind 侧会自动跳过图片解析
+    stickers = StickerBook(store, media_cfg, vision) if store is not None else None
+
     from ska.tools.base import ToolDeps, build_tools
     deps = ToolDeps(cfg=cfg, gateway=gateway, store=store, bus=bus)
     tools = build_tools(cfg.get("tools", []), deps)
@@ -140,7 +162,7 @@ def build() -> dict[str, Any]:
     agent = AgentLoop(gateway, tools, persona, bus=bus)
     mind = Mind(gateway, agent, store=store, summarizer=summarizer,
                 cfg=cfg, persona_prompt=persona, policy=policy,
-                bus=bus, builder=builder)
+                bus=bus, builder=builder, stickers=stickers)
 
     # 心跳：单例 ctx 作为兜底，多会话走 registry 路由（阶段三 §2.2）
     ctx = SessionContext(window=int(cfg.memory.get("working_window", 20)))
@@ -157,7 +179,18 @@ def build() -> dict[str, Any]:
         "service": None, "auth": None, "api": None, "web": None,
         # ---- 阶段三新增 ----
         "chat_hub": hub, "registry": registry, "trace": trace, "builder": builder,
+        # ---- 阶段四新增：图片/表情包 ----
+        "stickers": stickers, "vision": vision,
+        "vision_gateway": vision_gateway if vision_gateway is not gateway else None,
     }
+
+    # 插件运行时管理器（热装载/热重载/热卸载的唯一入口）：
+    # 必须在 app 组装完之后建，因为它要读 app["tools"] / app["bus"] / app["plugin_map"]。
+    # 同时挂进 tool_deps.extra，让 Agent 的 plugin_ops 工具能直接操作它（自举）。
+    from ska.plugins.manager import PluginManager
+    plugin_manager = PluginManager(app, settings=settings, store=admin_store)
+    app["plugin_manager"] = plugin_manager
+    deps.extra["plugin_manager"] = plugin_manager
 
     # 后台业务聚合 + HTTP 服务（阶段二 §5.3）
     if admin_store is not None and settings is not None:
@@ -168,6 +201,8 @@ def build() -> dict[str, Any]:
         service = AdminService(app=app, store=admin_store, memory=store,
                                settings=settings, providers=providers, policy=policy)
         gateway.on_usage = service.record_usage          # 每次 LLM 调用后把用量落库
+        if app.get("vision_gateway") is not None:        # 独立视觉端点同样计入用量
+            app["vision_gateway"].on_usage = service.record_usage
         web_cfg = settings.web()
         app["service"] = service
         app["auth"] = AuthService(admin_store,
@@ -181,57 +216,36 @@ def build() -> dict[str, Any]:
     return app
 
 
-def install_plugins(app: dict[str, Any]) -> None:
-    """按名 importlib 加载插件并调用 install(bus, cfg)。
+async def install_plugins(app: dict[str, Any]) -> None:
+    """按名装载插件（委托给 PluginManager，统一处理订阅/工具回收）。
 
-    必须在事件循环内调用：scheduler 需要在循环里 create_task。
-    阶段二：同时把实例登记进 app["plugin_map"]（name → instance），
-    这样后台「插件拓展」页可以按名热卸载（调用实例的 stop()）。
+    必须在事件循环内调用（run() 中 await）：scheduler 需要在循环里 create_task，
+    插件卸载钩子也可能是协程。插件实例登记进 app["plugin_map"]（name → instance），
+    后台可在运行期热卸载/热重载。
     """
-    bus, cfg = app["bus"], app["cfg"]
-    settings = app.get("settings")
-    names = settings.names("plugins") if settings is not None else list(cfg.get("plugins", []))
-    plugin_map = app.setdefault("plugin_map", {})
-    for name in names:
-        if name in plugin_map:                          # 幂等：已装的跳过
+    manager = app.get("plugin_manager")
+    if manager is None:                       # 兜底：未走 build() 的调用方
+        from ska.plugins.manager import PluginManager
+        manager = PluginManager(app)
+        app["plugin_manager"] = manager
+
+    for name in manager.enabled_names():
+        if name in app.get("plugin_map", {}):  # 幂等：已装的跳过
             continue
         try:
-            module = importlib.import_module(f"ska.plugins.{name}")
-        except ImportError:
-            logger.warning("未知插件：%s", name)
-            continue
-        instance = module.install(bus, cfg)
-        plugin_map[name] = instance
-        app["plugins"].append(instance)
-        _collect_plugin_tools(app, instance)      # 插件可选地顺带贡献工具（阶段三增强）
+            await manager.install(name)
+        except Exception as e:  # noqa: BLE001 —— 单个插件坏掉不拖垮启动
+            logger.warning("插件 %s 装载失败：%s", name, e)
 
 
 def _collect_plugin_tools(app: dict[str, Any], instance: Any) -> None:
-    """把插件贡献的工具合入工具表（可选钩子：contribute_tools(deps) -> {name: Tool}）。
+    """把插件贡献的工具合入工具表（保留的兼容入口，委托给 PluginManager）。
 
-    与 MCPManager.inject 同理：合入的是同一张 tools dict，因此 AgentLoop 立即可见、
-    Policy 自动纳管；名字冲突时以既有工具为准（不覆盖内置/已装工具）。
+    既有测试直接调用本函数；实现唯一化到 ska.plugins.manager.collect_plugin_tools，
+    避免「两份逻辑、行为漂移」。
     """
-    contributor = getattr(instance, "contribute_tools", None)
-    if not callable(contributor):
-        return
-    try:
-        produced = contributor(app.get("tool_deps"))
-    except Exception:  # noqa: BLE001 —— 插件出错不能拖垮装配
-        logger.exception("插件贡献工具失败：%s", type(instance).__name__)
-        return
-    if not isinstance(produced, dict):
-        return
-    target = app["tools"]
-    added = 0
-    for name, tool in produced.items():
-        if name in target:
-            logger.warning("插件工具名冲突，忽略：%s", name)
-            continue
-        target[name] = tool
-        added += 1
-    if added:
-        logger.info("插件 %s 贡献了 %d 个工具", type(instance).__name__, added)
+    from ska.plugins.manager import collect_plugin_tools
+    collect_plugin_tools(app, instance)
 
 
 async def _start_mcp(app: dict[str, Any], mcp: Any) -> None:
@@ -253,7 +267,7 @@ async def _start_mcp(app: dict[str, Any], mcp: Any) -> None:
 async def run(app: dict[str, Any]) -> None:
     """启动渠道并进入心跳主循环。"""
     # 装插件（需在事件循环内，scheduler 依赖 create_task）
-    install_plugins(app)
+    await install_plugins(app)
 
     # MCP 外部工具：后台拉起服务器并把发现的工具合入工具表（同一 dict，AgentLoop 立即可见）。
     # 放后台是刻意的——服务器启动可能较慢/超时，不该拖住渠道与主循环的启动。
@@ -348,6 +362,13 @@ async def shutdown(app: dict[str, Any]) -> None:
             await gateway.aclose()
         except Exception:  # noqa: BLE001
             logger.exception("网关关闭异常")
+    # 独立视觉网关（复用主网关时为 None，避免重复关闭）
+    vision_gateway = app.get("vision_gateway")
+    if vision_gateway is not None:
+        try:
+            await vision_gateway.aclose()
+        except Exception:  # noqa: BLE001
+            logger.exception("视觉网关关闭异常")
     # 5) 管理库（放最后：其他组件可能仍在读设置）
     admin_store = app.get("admin_store")
     if admin_store is not None:

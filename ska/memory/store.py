@@ -105,6 +105,25 @@ CREATE INDEX IF NOT EXISTS idx_core_user ON core_facts(user);
 -- FTS5 虚表：trigram 分词支持中文子串；standalone，rowid 与 long_memory.id 对齐
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
     USING fts5(content, keywords, tokenize='trigram');
+
+-- 本地表情包库（阶段四）：按内容 sha256 去重，首次遇到时下载 + 视觉解析，
+-- description/tags 供后续按语义检索；use_count/last_used 记录使用热度。
+CREATE TABLE IF NOT EXISTS stickers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash        TEXT NOT NULL UNIQUE,       -- 内容 sha256（图片）或 face:<id>（内置表情）
+    file        TEXT DEFAULT '',            -- 本地保存路径（内置表情为空）
+    url         TEXT DEFAULT '',            -- 首次来源 URL
+    kind        TEXT NOT NULL DEFAULT 'sticker',  -- sticker / image / face / mface
+    description TEXT DEFAULT '',            -- 视觉模型解析出的一句话含义
+    tags        TEXT DEFAULT '',            -- 检索关键词（空格分隔）
+    emotion     TEXT DEFAULT '',            -- 情绪标签（开心/无语/…）
+    user        TEXT DEFAULT '',            -- 首次发送者
+    channel     TEXT DEFAULT '',
+    use_count   INTEGER NOT NULL DEFAULT 0,
+    created_ts  REAL NOT NULL,
+    last_used   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sticker_seen ON stickers(last_used);
 """
 
 
@@ -579,6 +598,30 @@ class MemoryStore:
         """取核心记忆内容（按重要性、时间排序），供决策提示词常驻注入。"""
         return await self._call(self._list_core_sync, user, limit)
 
+    async def list_core_entries(self, *, user: str = "",
+                                limit: int = 100) -> list[dict[str, Any]]:
+        """列出核心记忆的完整记录（后台「记忆管理」页用）。
+
+        与 list_core 的区别：list_core 只返回注入提示词用的纯文本，
+        这里返回整行（id / importance / user / created_ts），
+        后台才能展示明细并按 id 删除，避免「Agent 记住了但页面上看不到」。
+        """
+        return await self._call(self._list_core_entries_sync, user, limit)
+
+    def _list_core_entries_sync(self, user: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            if user:
+                rows = self._conn.execute(
+                    "SELECT * FROM core_facts WHERE user IN ('', ?)"
+                    " ORDER BY importance DESC, created_ts ASC LIMIT ?",
+                    (user, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM core_facts"
+                    " ORDER BY importance DESC, created_ts ASC LIMIT ?",
+                    (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
     def _list_core_sync(self, user: str, limit: int) -> list[str]:
         with self._lock:
             if user:
@@ -593,13 +636,182 @@ class MemoryStore:
                     (limit,)).fetchall()
         return [r["content"] for r in rows]
 
+    async def delete_core(self, core_id: int) -> bool:
+        """按 id 删除一条核心记忆（后台按行删除用；unpin 是按内容删）。"""
+        return await self._call(self._delete_core_sync, core_id)
+
+    def _delete_core_sync(self, core_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM core_facts WHERE id=?", (core_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    async def delete_fact(self, fact_id: int) -> bool:
+        """按 id 删除一条结构化事实（后台纠错用）。"""
+        return await self._call(self._delete_fact_sync, fact_id)
+
+    def _delete_fact_sync(self, fact_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM entity_facts WHERE id=?", (fact_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------ 表情包库
+    # 设计：hash 是唯一键（图片按内容 sha256，内置表情按 face:<id>）——
+    # 同一个表情包被人反复发，只会解析一次、落库一次，后续直接命中缓存。
+    async def get_sticker(self, hash_key: str) -> dict[str, Any] | None:
+        """按 hash 查表情包（命中说明之前已经下载并解析过）。"""
+        return await self._call(self._get_sticker_sync, hash_key)
+
+    def _get_sticker_sync(self, hash_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM stickers WHERE hash=?", (hash_key,)).fetchone()
+        return dict(row) if row else None
+
+    async def add_sticker(self, hash_key: str, *, file: str = "", url: str = "",
+                          kind: str = "sticker", description: str = "",
+                          tags: str = "", emotion: str = "", user: str = "",
+                          channel: str = "") -> int:
+        """写入一条表情包记录；hash 冲突时忽略（幂等），返回其 id。"""
+        return await self._call(self._add_sticker_sync, hash_key, file, url, kind,
+                                description, tags, emotion, user, channel)
+
+    def _add_sticker_sync(self, hash_key: str, file: str, url: str, kind: str,
+                          description: str, tags: str, emotion: str, user: str,
+                          channel: str) -> int:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO stickers(hash, file, url, kind, description,"
+                " tags, emotion, user, channel, use_count, created_ts, last_used)"
+                " VALUES(?,?,?,?,?,?,?,?,?,0,?,?)",
+                (hash_key, file, url, kind, description, tags, emotion, user,
+                 channel, now, now))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT id FROM stickers WHERE hash=?", (hash_key,)).fetchone()
+        return int(row["id"]) if row else 0
+
+    async def touch_sticker(self, sticker_id: int) -> None:
+        """记录一次使用：热度 +1、刷新 last_used（供排序与后台展示）。"""
+        await self._call(self._touch_sticker_sync, sticker_id)
+
+    def _touch_sticker_sync(self, sticker_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE stickers SET use_count=use_count+1, last_used=? WHERE id=?",
+                (time.time(), sticker_id))
+            self._conn.commit()
+
+    async def list_stickers(self, limit: int = 100) -> list[dict[str, Any]]:
+        """列出表情包库（按最近使用/创建时间倒序）。"""
+        return await self._call(self._list_stickers_sync, limit)
+
+    def _list_stickers_sync(self, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM stickers ORDER BY last_used DESC, id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_sticker_by_id(self, sticker_id: int) -> dict[str, Any] | None:
+        """按主键取一条表情包（后台编辑/删除前先取旧值）。"""
+        return await self._call(self._get_sticker_by_id_sync, sticker_id)
+
+    def _get_sticker_by_id_sync(self, sticker_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM stickers WHERE id=?", (sticker_id,)).fetchone()
+        return dict(row) if row else None
+
+    async def update_sticker(self, sticker_id: int, *, description: str | None = None,
+                             tags: str | None = None, emotion: str | None = None,
+                             file: str | None = None) -> bool:
+        """后台手动编辑表情包：只更新传入的字段（None = 保持原值）。"""
+        return await self._call(self._update_sticker_sync, sticker_id, description,
+                                tags, emotion, file)
+
+    def _update_sticker_sync(self, sticker_id: int, description: str | None,
+                             tags: str | None, emotion: str | None,
+                             file: str | None) -> bool:
+        fields: list[str] = []
+        values: list[Any] = []
+        for name, value in (("description", description), ("tags", tags),
+                            ("emotion", emotion), ("file", file)):
+            if value is not None:
+                fields.append(f"{name}=?")
+                values.append(str(value).strip())
+        if not fields:                       # 什么都没传：视为无操作
+            return False
+        values.append(sticker_id)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE stickers SET {', '.join(fields)} WHERE id=?", values)
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    async def search_stickers(self, query: str, *, top_k: int = 8,
+                              user: str = "") -> list[dict[str, Any]]:
+        """检索表情包：**tag 优先** + 2-gram 相关度兜底（中文友好、零依赖）。
+
+        query 支持简单的关系运算（只作用于 tags/emotion 字段，不看描述）：
+            "开心"        → 命中含「开心」的标签
+            "开心 猫"     → OR：任一标签组命中即可（空格/逗号分隔）
+            "开心+猫"     → AND：两个标签必须同时命中
+        只要有表情包按标签命中，就只在命中的里面挑；全部没命中才用描述做
+        2-gram 相关度兜底（保证没有标签的历史数据仍可检索）。
+        """
+        return await self._call(self._search_stickers_sync, query, top_k, user)
+
+    def _search_stickers_sync(self, query: str, top_k: int,
+                              user: str) -> list[dict[str, Any]]:
+        with self._lock:
+            if user:
+                rows = self._conn.execute(
+                    "SELECT * FROM stickers WHERE user IN ('', ?)", (user,)).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM stickers").fetchall()
+        groups = _tag_groups(query)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            text = f"{item.get('description', '')} {item.get('tags', '')} " \
+                   f"{item.get('emotion', '')}"
+            # 关系运算只作用于「标签」字段（emotion 也算一个标签）：描述是模型写的
+            # 自然语言，拿它做 AND/OR 会误命中；背景相关度仍可看整段文本兜底。
+            tag_text = f"{item.get('tags', '')} {item.get('emotion', '')}"
+            tag_score = _tag_score(tag_text, groups)
+            score = tag_score * 10.0 + _relevance(query, text)
+            if score <= 0:
+                continue
+            scored.append((score, tag_score > 0, item))
+        # 只要有任何一个表情包「按标签命中」，就只在命中标签的里面挑：
+        # 这样 "开心+猫" 才是真正的 AND（组内必须全中），而不是「沾一个词就算」；
+        # 全部标签都没命中时才退回 2-gram 相关度，老数据（没标签）依然搜得到。
+        exact = [(s, item) for s, hit, item in scored if hit]
+        pool = exact or [(s, item) for s, _hit, item in scored]
+        # 相关度优先；同分时常用、近用的靠前（避免永远只发最早那几个）
+        pool.sort(key=lambda x: (x[0], x[1].get("use_count", 0),
+                                 x[1].get("last_used", 0)), reverse=True)
+        return [item for _, item in pool[:max(top_k, 1)]]
+
+    async def delete_sticker(self, sticker_id: int) -> bool:
+        return await self._call(self._delete_sticker_sync, sticker_id)
+
+    def _delete_sticker_sync(self, sticker_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM stickers WHERE id=?", (sticker_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
     # ------------------------------------------------------------------ 辅助
     def stats(self) -> dict[str, int]:
         """各表行数（人工核对用）。"""
         with self._lock:
             out = {}
             for table in ("messages", "sessions", "long_memory", "profile",
-                          "entity_facts", "core_facts"):
+                          "entity_facts", "core_facts", "stickers"):
                 out[table] = self._conn.execute(
                     f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
         return out
@@ -666,3 +878,27 @@ def _relevance(query: str, text: str) -> float:
     if not q:
         return 0.0
     return len(q & _char_grams(text)) / len(q)
+
+
+def _tag_groups(query: str) -> list[list[str]]:
+    """把查询拆成 tag 关系组：外层 OR（空格/逗号），组内 AND（+）。
+
+    例："开心+猫 无语" → [["开心", "猫"], ["无语"]]
+    这样既能一次给多个候选（OR 提高命中率），也能用 + 精确收窄。
+    """
+    groups: list[list[str]] = []
+    for term in re.split(r"[\s,，]+", (query or "").strip()):
+        parts = [p.strip().lower() for p in term.split("+") if p.strip()]
+        if parts:
+            groups.append(parts)
+    return groups
+
+
+def _tag_score(text: str, groups: list[list[str]]) -> int:
+    """统计命中的关系组数（组内必须全部命中才算 +1），作为 tag 优先的强信号。"""
+    haystack = (text or "").lower()
+    score = 0
+    for parts in groups:
+        if all(part in haystack for part in parts):
+            score += len(parts)            # AND 命中的词越多，分越高
+    return score

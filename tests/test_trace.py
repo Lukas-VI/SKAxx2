@@ -70,6 +70,20 @@ class TestTraceLog(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await emit_trace(None, trace_id="x", session="",
                                            lane="think", kind="decision"))
 
+    async def test_invalid_kind_is_skipped_not_raised(self):
+        """轨迹是旁路观测：kind 拼错时只丢这一条，绝不能让整轮对话抛异常。"""
+        self.assertIsNone(await emit_trace(self.bus, trace_id="t1", session="s1",
+                                           lane="input", kind="not_a_kind"))
+        self.assertEqual(self.log.recent(), [])
+
+    async def test_image_and_sticker_kinds_accepted(self):
+        """阶段四新增的两种轨迹类型必须在白名单里。"""
+        await emit_trace(self.bus, trace_id="t1", session="s1", lane="input",
+                         kind="image", title="图片解析")
+        await emit_trace(self.bus, trace_id="t1", session="s1", lane="act",
+                         kind="sticker", title="发表情包")
+        self.assertEqual([x["kind"] for x in self.log.recent()], ["image", "sticker"])
+
     async def test_clear_empties_buffer_and_store(self):
         await emit_trace(self.bus, trace_id="t1", session="s1", lane="think", kind="decision")
         await self.log.on_event(Event(topic=TOPIC_TRACE,
@@ -126,7 +140,6 @@ class TestMindInstrumentation(unittest.IsolatedAsyncioTestCase):
 
     def _mind(self) -> Mind:
         llm = _FakeLLM([
-            ("他在打招呼。", None),                      # 内独白
             ('{"action":"speak","content":"你好呀","importance":0.4,"reason":"礼貌"}', None),
         ])
         loop = AgentLoop(llm, {}, "你是助手")
@@ -163,7 +176,6 @@ class TestMindInstrumentation(unittest.IsolatedAsyncioTestCase):
     async def test_no_bus_still_runs(self):
         """未注入总线（阶段二老构造）也能正常跑，插桩零侵入。"""
         llm = _FakeLLM([
-            ("随便想想。", None),
             ('{"action":"speak","content":"好呀","importance":0.3,"reason":"回应"}', None),
         ])
         loop = AgentLoop(llm, {}, "你是助手")
